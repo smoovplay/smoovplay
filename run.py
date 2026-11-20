@@ -606,7 +606,6 @@ def main() -> int:
         unavailable["model"] = f"RIFE {test_model}, set by --model on the command line, for testing."
     if dml_mode:
         unavailable["engine"] = "Without an NVIDIA card, RIFE runs through DirectML (Experimental)."
-        unavailable["steady_hud"] = "Not with DirectML yet."
         unavailable.setdefault("model", "NVIDIA VFG needs an NVIDIA RTX card.")
     choices = {"engine": ("auto", "trt", "torch") if has_trt else ("auto", "torch"),
                "model": tuple(m for m in BY_KEY["model"].choices if m != "vfg" or not vfg_why[0])}

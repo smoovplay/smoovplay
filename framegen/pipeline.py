@@ -546,7 +546,9 @@ class Pipeline:
                     steady = settings.steady_hud
                     if hasattr(it, "set_steady"):
                         it.set_steady(STEADY_HUD_THRESHOLD if steady else 0.0)
-                    print(f"[pipeline] steady HUD {'ON' if steady else 'OFF'}")
+                        print(f"[pipeline] steady HUD {'ON' if steady else 'OFF'}")
+                    elif steady:
+                        print("[pipeline] steady HUD isn't available with this engine")
             t0 = time.perf_counter()
             st.queue_ms.append((t0 - tick.t_arrival) * 1000)
             if torch.is_tensor(tick.frame):  # already on the GPU (hardware decoder)
