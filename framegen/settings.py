@@ -302,6 +302,12 @@ SPECS: tuple[Spec, ...] = (
                 "large": "For a TV across the room."},
          help="How big the stats are. Small stays out of the way of the game's own HUD; Large is for a TV across the "
               "room."),
+    # framegen/debugsnap.py. Session only, like Simulate: for finding out what the pipeline does in a real game.
+    Spec("debug", "Debug snapshots", (False, True), False, ON_OFF, saved=False, group="Display",
+         help="For reporting a problem: every 5 seconds the real frame, and where Steady HUD keeps the game's own "
+              "pixels, are saved as pictures in a debug folder beside the session's log, with a line in the log. "
+              "This session only.",
+         impact={"speed": "A short pause every 5 seconds while a snapshot is saved."}),
     # framegen/replay.py. Memory in the hints: replay.memory_mb() for 1080p at 90 fps (tests/test_replay.py checks).
     Spec("replay", "Instant replay", (0, 30, 60, 120, 300), 0,
          {0: "Off", 30: "Last 30 seconds", 60: "Last minute", 120: "Last 2 minutes", 300: "Last 5 minutes"},

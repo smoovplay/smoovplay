@@ -144,7 +144,8 @@ made-up PCs.
 | Minimise chiaki-ng | On / Off | live (PS5 Remote Play only) |
 | Sound in sync | On / Off (chiaki-ng holds its sound back to meet the picture) | live (PS5 Remote Play only) |
 | Simulate a 30 fps game | Off / On | live, this session only, never saved (any 60 Hz source: Remote Play, a capture card, or a file with `--raw`; `--test-mode`) |
-| Steady HUD | Off / On (off by default; results vary by game; RIFE and NVIDIA VFG, [`framegen/steady.py`](../framegen/steady.py)) | live |
+| Debug snapshots | Off / On (this session only, never saved: every 5 s the real frame and Steady HUD's mask go into `logs\debug-<session>\`, with a `[debug]` line in the log; [`framegen/debugsnap.py`](../framegen/debugsnap.py)) | live |
+| Steady HUD | Off / On (off by default; results vary by game; RIFE on CUDA and DirectML, and NVIDIA VFG, [`framegen/steady.py`](../framegen/steady.py)) | live |
 | Look, Which look | Off / On, and SmoovPlay's looks and yours (made on the launcher's Looks page) | live |
 | Looks in clips | Off / On (the look in saved instant replays too; only SmoovPlay's half of a before & after video) | live |
 | Interpolation model | RIFE 4.22 lite / NVIDIA VFG (RTX 40 and 50 series, optional download, see below) | **restart** |
