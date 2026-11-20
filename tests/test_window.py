@@ -2,6 +2,8 @@
 window or screen is read. Also the learned repeat rule it uses (cadence.DuplicateDetector(learn=True))."""
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pytest
 import torch
@@ -115,6 +117,7 @@ class _Shell:
         monkeypatch.setattr(window, "client_rect", lambda h: Rect(0, 0, 1280, 720))
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="listing windows (EnumWindows) is Windows-only")
 def test_a_store_apps_frame_is_listed_as_the_app_inside_it(monkeypatch):
     _Shell(monkeypatch)
     found = {w.hwnd: w for w in window.find_windows()}
@@ -447,6 +450,7 @@ def test_open_window_scales_to_the_streams_size(monkeypatch):
 
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="listing windows (EnumWindows) is Windows-only")
 def test_a_running_streaming_app_left_off_the_list_says_why(monkeypatch):
     shell = _Shell(monkeypatch)
     u32 = window._api()[0]

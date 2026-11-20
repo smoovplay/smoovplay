@@ -2,6 +2,7 @@
 held to it (with a hidden OpenGL window, when there is one)."""
 import io
 import json
+import re
 
 import numpy as np
 import pytest
@@ -328,6 +329,12 @@ def gl():
         glfw.terminate()
         pytest.skip("no OpenGL 4.5 context")
     glfw.make_context_current(win)
+    version = (GL.glGetString(GL.GL_VERSION) or b"").decode(errors="replace")
+    m = re.match(r"(\d+)\.(\d+)", version)
+    if not m or (int(m[1]), int(m[2])) < (4, 5):  # e.g. macOS: 2.1, or 4.1 at most
+        glfw.destroy_window(win)
+        glfw.terminate()
+        pytest.skip(f"no OpenGL 4.5 context (got {version})")
     GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
     GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 1)
     yield GL
