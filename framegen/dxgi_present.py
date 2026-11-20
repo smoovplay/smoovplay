@@ -40,9 +40,15 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 import time
 import uuid
-from ctypes import POINTER, WINFUNCTYPE, byref, c_char_p, c_int, c_long, c_size_t, c_uint, c_ulong, c_void_p
+from ctypes import POINTER, byref, c_char_p, c_int, c_long, c_size_t, c_uint, c_ulong, c_void_p
+
+if sys.platform == "win32":
+    from ctypes import WINFUNCTYPE
+else:  # importable elsewhere (its structures and the presentation choice are tested on macOS); never called there
+    from ctypes import CFUNCTYPE as WINFUNCTYPE
 
 # ---------------------------------------------------------------------------------------------- Windows constants
 DXGI_FORMAT_UNKNOWN = 0
