@@ -33,7 +33,7 @@ import re
 import sys
 import zlib
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 PREFIX = "SPL1-"
 MAX_NODES = 16
@@ -173,8 +173,10 @@ BY_CODE = {t.code: t for t in TYPES_LIST}
 
 
 def _lut_name(v) -> str:
-    """A LUT's file name, without folders (a share code or a file can't point anywhere else)."""
-    name = Path(str(v or "")).name.strip()
+    """A LUT's file name, without folders (a share code or a file can't point anywhere else). Windows' rules on every
+    system (the same as before there): a share code made on Windows can carry backslashes, which elsewhere aren't
+    folder separators."""
+    name = PureWindowsPath(str(v or "")).name.strip()
     return name[:120] if name.lower().endswith(".cube") else ""
 
 
