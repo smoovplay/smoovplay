@@ -186,7 +186,8 @@ def test_stream_converter_software_frames(tag):
     assert out.shape == (8, 16, 3) and out.dtype == torch.uint8
     want = hdr.convert_yuv(*flat((yc, uc, vc), 8, 16), PQ, "sdr8")
     assert torch.equal(out, want)  # untagged 10-bit is taken as HDR10, as a PS5 sends it
-    assert conv.describe() == "10-bit PQ BT.2020"
+    # ...and the log says which it was (the stream's own tags, or taken from the bit depth)
+    assert conv.describe() == "10-bit PQ BT.2020" + ("" if tag else " (no colour tags: taken as HDR10)")
     assert hdr.StreamConverter("pq16", device="cpu")(fr).dtype == torch.float16
 
 

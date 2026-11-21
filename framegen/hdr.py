@@ -1,4 +1,6 @@
-"""HDR from PS5 Remote Play: settings "hdr" (off by default; with it off nothing here runs).
+"""HDR from PS5 Remote Play: settings "hdr" (Auto by default: HDR output on a display with Windows' HDR on, "sdr" on
+any other; framegen/chiaki_settings.py picks chiaki-ng's codec to match). With it off, or a stream without HDR,
+nothing here runs.
 
 A PS5 streaming in HDR (chiaki-ng's H.265 HDR codec) sends 10-bit H.265 in HDR10: BT.2020 colours and PQ (SMPTE
 ST 2084) brightness, up to 10,000 nits. The rest of SmoovPlay works on 8-bit SDR frames, where that comes out washed
@@ -86,6 +88,12 @@ def pq_of_nits(nits: float) -> float:
     return float(pq_oetf(torch.tensor(nits / PQ_MAX_NITS, dtype=torch.float64)))
 
 
+def srgb_eotf(e: torch.Tensor) -> torch.Tensor:
+    """sRGB signal 0..1 -> light 0..1: the piecewise curve Windows shows SDR apps with on an HDR display. Its shadows
+    are much brighter than BT.1886's gamma 2.4 (a tenth of the way up: 2.5x)."""
+    return torch.where(e <= 0.04045, e / 12.92, ((e.clamp_min(0.0) + 0.055) / 1.055).pow(2.4))
+
+
 def hlg_to_nits(rgb: torch.Tensor, display_nits: float = HLG_DISPLAY_NITS) -> torch.Tensor:
     """HLG R'G'B' (..., 3, BT.2020) -> display light in nits: inverse OETF, then the OOTF for a display this bright."""
     e = rgb.clamp(0.0, 1.0)
@@ -135,6 +143,7 @@ class FrameInfo:
     matrix: int = SPC_BT2020_NCL
     transfer: int = TRC_PQ
     primaries: int = PRI_BT2020
+    tagged: bool = True  # the frame said its transfer; False: taken from its bit depth (describe() says so)
 
     @property
     def hdr(self) -> bool:
@@ -145,13 +154,23 @@ class FrameInfo:
         """From a PyAV frame. Untagged 10-bit HEVC from a PS5 in HDR mode is HDR10; untagged 8-bit is BT.709."""
         trc, pri, spc = fr.color_trc, fr.color_primaries, fr.colorspace
         hdr_default = bits > 8
-        if trc not in (TRC_PQ, TRC_HLG, TRC_BT709, 6, 14, 15):  # unknown or unspecified
+        tagged = trc in (TRC_PQ, TRC_HLG, TRC_BT709, 6, 14, 15)
+        if not tagged:  # unknown or unspecified
             trc = TRC_PQ if hdr_default else TRC_BT709
         if pri not in (PRI_BT709, PRI_BT2020, 5, 6):
             pri = PRI_BT2020 if trc in (TRC_PQ, TRC_HLG) else PRI_BT709
         if spc not in KR_KB and spc not in (5, 6):
             spc = SPC_BT2020_NCL if pri == PRI_BT2020 else SPC_BT709
-        return cls(bits, fr.color_range == RANGE_FULL, spc, trc, pri)
+        return cls(bits, fr.color_range == RANGE_FULL, spc, trc, pri, tagged)
+
+
+# A capture card's 10-bit P010 video (framegen/capture.py HdrCardSource), HDR10 or SDR as the card says the console
+# sends it (its colour tags don't change: framegen/elgato.py). Both limited range, as HDMI video is: an Elgato HD60 X's
+# HDR10 matched a PS5's Remote Play HDR stream of the same screen to about 2 codes, and its SDR, shown as Windows
+# shows SDR, matched Remote Play's picture of it (black at 64; white text overshoots past 940 at its edges, but read
+# as full range the picture came out washed out).
+P010_HDR10 = FrameInfo(10, False, SPC_BT2020_NCL, TRC_PQ, PRI_BT2020)
+P010_SDR = FrameInfo(10, False, SPC_BT709, TRC_BT709, PRI_BT709)
 
 
 def yuv_to_rgb(y: torch.Tensor, u: torch.Tensor, v: torch.Tensor, info: FrameInfo) -> torch.Tensor:
@@ -175,13 +194,15 @@ def yuv_to_rgb(y: torch.Tensor, u: torch.Tensor, v: torch.Tensor, info: FrameInf
     return torch.stack([r, g, b], -1).clamp_(0.0, 1.0)
 
 
-def rgb_to_nits(rgb: torch.Tensor, info: FrameInfo, sdr_nits: float = SDR_WHITE_NITS) -> torch.Tensor:
-    """R'G'B' in the stream's transfer -> linear light in nits, still in the stream's primaries."""
+def rgb_to_nits(rgb: torch.Tensor, info: FrameInfo, sdr_nits: float = SDR_WHITE_NITS,
+                srgb: bool = False) -> torch.Tensor:
+    """R'G'B' in the stream's transfer -> linear light in nits, still in the stream's primaries. srgb: SDR as Windows
+    shows SDR apps (srgb_eotf), not as BT.1886 video."""
     if info.transfer == TRC_PQ:
         return pq_eotf(rgb) * PQ_MAX_NITS
     if info.transfer == TRC_HLG:
         return hlg_to_nits(rgb)
-    return rgb.pow(SDR_GAMMA) * sdr_nits
+    return (srgb_eotf(rgb) if srgb else rgb.pow(SDR_GAMMA)) * sdr_nits
 
 
 def nits_to_sdr8(rgb: torch.Tensor, primaries: int, src_peak: float, sdr_nits: float = SDR_WHITE_NITS) -> torch.Tensor:
@@ -295,12 +316,13 @@ def _yuv_to_rgb_full(y, u, v, info: FrameInfo) -> torch.Tensor:
     return torch.stack([r, g, b], -1).clamp_(0.0, 1.0)
 
 
-def _yuv_lut(info: FrameInfo, out: str, src_peak: float, display_peak: float | None, sdr_nits: float, device) -> Lut3D:
+def _yuv_lut(info: FrameInfo, out: str, src_peak: float, display_peak: float | None, sdr_nits: float, device,
+             srgb: bool = False) -> Lut3D:
     """A LUT from Y'CbCr codes (chroma at full size) to: sdr8, linear BT.709 BGR (1 = SDR white) before it's clipped
-    (_sdr_finish does the rest); pq16, BGR PQ 0..1."""
+    (_sdr_finish does the rest); pq16, BGR PQ 0..1. srgb: see rgb_to_nits."""
     def frame_fn(y, u, v):
         rgb = _yuv_to_rgb_full(y, u, v, info)
-        nits = rgb_to_nits(rgb, info, sdr_nits)
+        nits = rgb_to_nits(rgb, info, sdr_nits, srgb)
         if out == "sdr8":
             rgb = tone_map_nits(nits, src_peak, sdr_nits) / sdr_nits
             if info.primaries == PRI_BT2020:
@@ -418,14 +440,20 @@ class StreamConverter:
     as their planes, a third of the bytes of a BGR frame."""
 
     def __init__(self, out: str = "sdr8", device: str = "cuda", src_peak: float = SOURCE_PEAK_NITS,
-                 display_peak: float | None = None) -> None:
+                 display_peak: float | None = None, sdr_nits: float | None = None) -> None:
+        """sdr_nits: for an SDR stream in HDR output (pq16), show it as Windows shows SDR apps: white at this (Windows'
+        SDR content brightness) and the sRGB curve, so it looks as it did as an SDR window. Else BT.1886 video with
+        white at SDR_WHITE_NITS."""
         if out not in ("sdr8", "pq16"):
             raise ValueError(out)
         self.out, self.device = out, torch.device(device)
         self.src_peak, self.display_peak = src_peak, display_peak
+        self.sdr_nits = sdr_nits
         self.info: FrameInfo | None = None  # the last frame's, for the log
         self.said = False
-        self.lut: Lut3D | None = None  # for self.info (made again if a stream's tags change)
+        self.lut: Lut3D | None = None  # for self.info
+        self._luts: dict = {}  # one per FrameInfo seen, so a stream that switches between HDR and SDR (a capture
+        # card's console turning its HDR on and off) doesn't make them again each time
 
     def __call__(self, fr) -> torch.Tensor:
         fmt = fr.format.name
@@ -443,19 +471,24 @@ class StreamConverter:
                 bits, yf, uf, vf = 8, y.float(), uv[..., 0].float(), uv[..., 1].float()
         else:
             bits, (yf, uf, vf) = self._planes(fr)
-        info = FrameInfo.of(fr, bits)
-        if info != self.info:
-            self.info, self.said, self.lut = info, False, None
-        return self.convert(yf, uf, vf, info)
+        return self.convert(yf, uf, vf, FrameInfo.of(fr, bits))
 
     def convert(self, y: torch.Tensor, u: torch.Tensor, v: torch.Tensor, info: FrameInfo) -> torch.Tensor:
         """Y'CbCr code planes (floats, chroma at half size) -> the pipeline's frame. HDR10 kept as HDR10 is just the
-        matrix; anything else goes through a 3D LUT of convert_yuv's maths."""
+        matrix; anything else goes through a 3D LUT of convert_yuv's maths. `info` may change from frame to frame."""
+        if info != self.info:
+            self.info, self.said, self.lut = info, False, self._luts.get(info)
         if self.out == "pq16" and info.transfer == TRC_PQ and info.primaries == PRI_BT2020 and (
                 self.display_peak is None or self.display_peak >= self.src_peak):
             return yuv_to_rgb(y, u, v, info).flip(-1).to(torch.float16)
+        if self.out == "sdr8" and not info.hdr and info.primaries != PRI_BT2020:  # SDR in 10 bits: just 8 bits
+            return yuv_to_rgb(y, u, v, info).flip(-1).mul_(255.0).round_().to(torch.uint8)
         if self.lut is None:
-            self.lut = _yuv_lut(info, self.out, self.src_peak, self.display_peak, SDR_WHITE_NITS, y.device)
+            # an SDR stream to HDR output as Windows shows SDR apps (sdr_nits); otherwise HDR's reference white (the
+            # level HDR is fitted to for SDR output)
+            windows = self.sdr_nits is not None and self.out == "pq16" and not info.hdr
+            self.lut = self._luts[info] = _yuv_lut(info, self.out, self.src_peak, self.display_peak,
+                                                   self.sdr_nits if windows else SDR_WHITE_NITS, y.device, windows)
         uf, vf = _upsample_uv(u, v, y.shape)
         out = self.lut(y, uf, vf)
         return _sdr_finish(out) if self.out == "sdr8" else out.to(torch.float16)
@@ -487,4 +520,5 @@ class StreamConverter:
             return "no frame yet"
         trc = {TRC_PQ: "PQ", TRC_HLG: "HLG"}.get(i.transfer, "SDR gamma")
         pri = {PRI_BT2020: "BT.2020", PRI_BT709: "BT.709"}.get(i.primaries, f"primaries {i.primaries}")
-        return f"{i.bits}-bit {trc} {pri}{' full range' if i.full_range else ''}"
+        guessed = "" if i.tagged else f" (no colour tags: taken as {'HDR10' if i.hdr else 'SDR'})"
+        return f"{i.bits}-bit {trc} {pri}{' full range' if i.full_range else ''}{guessed}"

@@ -13,6 +13,10 @@ How (research_notes/Expansion planning/sources.md, section 2):
 - Sound: the card's own audio device, opened with the video (one DirectShow graph, so both are timed by the same
   clock) and played on this PC through framegen/audio.py, held back to meet the picture. pick_audio() finds it by
   name; --capture-audio names another, or "off".
+- HDR (open_hdr, HdrCardSource): with SmoovPlay's HDR setting on and an NVIDIA card, a card's 10-bit P010 video, which
+  FFmpeg can't read, comes through Windows Media Foundation instead (framegen/mf_capture.py), and framegen/hdr.py
+  reads it as HDR10 or SDR. The card's colour tags are the same either way, so which one is asked of the card where
+  it can say (an Elgato HD60 X: framegen/elgato.py); on Auto, only such a card is read in 10 bits.
 
 Untested with real cards. Written from FFmpeg's documentation and source and other viewers' notes (NitLink, MIT;
 CapturePlay and Veyra, GPL, ideas only), and tested with a raw video file standing in for a card
@@ -381,8 +385,10 @@ def pick_mode(modes: list[Mode], w: int = 1920, h: int = 1080, fps: float = 60.0
         notes.append("the card offers 1280x720 at 30 fps at most, as cards do on a USB 2 port: connect it to a USB 3 "
                      "port (blue, ideally on the back of the PC)")
     if any(m.fmt in _UNREADABLE.values() for m in modes):
-        notes.append("the card also offers 10-bit HDR, which SmoovPlay can't read yet, so it uses 8-bit "
-                     f"{best.fmt.upper()}: if the picture looks washed out, turn HDR off on the console")
+        notes.append(f"the card also offers 10-bit HDR, but this time SmoovPlay uses 8-bit {best.fmt.upper()}: if the "
+                     "picture looks washed out, the console is sending HDR, so turn HDR off on the console, or set "
+                     "SmoovPlay's HDR to On (HDR on Auto reads 10-bit only from a card that says when the console "
+                     "sends HDR, the Elgato HD60 X)")
     return best, "; ".join(notes)
 
 
@@ -460,38 +466,19 @@ class CardSource:
 
     def __init__(self, container, name: str, live: bool, test=None, device: str | None = "auto",
                  colour="auto", range_hint: str = "", queue_size: int = 3, decode_to: str = "", audio=None) -> None:
-        from .sources import source_info
-        self.container, self.live, self.test = container, live, test
+        self.container = container
         self.stream = container.streams.video[0]
-        self.astream = container.streams.audio[0] if audio is not None and container.streams.audio else None
-        self._audio_out, self.player, self._resampler = audio, None, None
-        self._audio_wait: list = []  # a file's sound, held until the picture gets to it: (time, pcm)
-        self._replay_sound: deque = deque(maxlen=2000)  # the sound as it's played, for instant replay (read_sound)
-        # How late each stream arrives after its own timestamps (the same clock in one DirectShow graph), so the
-        # sound can be held back by the picture's delay less however much later it already comes.
-        self._late_v: list[float] = []
-        self._late_a: list[float] = []
         cc = self.stream.codec_context
-        self.w, self.h = cc.width, cc.height
         self.raw = cc.name == "rawvideo"
         self.fmt = (cc.format.name if cc.format is not None else "") if self.raw else cc.name
         self.decode_to = decode_to  # a video file standing in: decoded, then sent on as raw frames of this format
         if decode_to:
             self.raw, self.fmt = True, decode_to
         rate = self.stream.average_rate or self.stream.base_rate or self.stream.guessed_rate
-        self.fps = float(rate) if rate else 60.0
-        if device == "auto":
-            device = _cuda_device()
-        self.device = device
+        self._setup(name, live, test, device, cc.width, cc.height, float(rate) if rate else 60.0, queue_size, audio,
+                    container.streams.audio[0] if audio is not None and container.streams.audio else None)
+        device = self.device  # "auto" worked out
         self.bt709, self.full_range = (self.h >= 720, range_hint == "pc") if colour == "auto" else colour
-        self.info = source_info("capture", hz=self.fps, name=name)
-        self.dropped = 0
-        self.damaged = 0  # frames the decoder couldn't read, skipped (_damaged)
-        self._damaged_since: float | None = None  # when the current run of them began
-        self._stop = False
-        self._go = threading.Event()
-        self.q: queue.Queue = queue.Queue(maxsize=queue_size)
-        self._host = None  # a reusable (pinned, with CUDA) buffer for raw frames on their way to the GPU
         # MJPEG on the GPU: NVDEC decodes it and the frame stays there (as Remote Play's do). Made on the reader's
         # thread, in PyTorch's CUDA context; if it fails, the CPU decodes instead.
         self._gpu_jpeg = not self.raw and self.fmt == "mjpeg" and device == "cuda"
@@ -508,6 +495,32 @@ class CardSource:
             print(f"[capture] sound: {cc.sample_rate} Hz, {cc.channels} channel(s), played on this PC, held back to "
                   "meet the picture")
         threading.Thread(target=self._reader, daemon=True, name="capture").start()
+
+    def _setup(self, name: str, live: bool, test, device: str | None, w: int, h: int, fps: float, queue_size: int,
+               audio, astream) -> None:
+        """What every card source has: the picture's queue and the sound's player (HdrCardSource too)."""
+        from .sources import source_info
+        self.live, self.test = live, test
+        self.w, self.h, self.fps = w, h, fps
+        self.astream = astream
+        self._audio_out, self.player, self._resampler = audio, None, None
+        self._audio_wait: list = []  # a file's sound, held until the picture gets to it: (time, pcm)
+        self._replay_sound: deque = deque(maxlen=2000)  # the sound as it's played, for instant replay (read_sound)
+        # How late each stream arrives after its own timestamps (the same clock in one DirectShow graph), so the
+        # sound can be held back by the picture's delay less however much later it already comes.
+        self._late_v: list[float] = []
+        self._late_a: list[float] = []
+        if device == "auto":
+            device = _cuda_device()
+        self.device = device
+        self.info = source_info("capture", hz=fps, name=name)
+        self.dropped = 0
+        self.damaged = 0  # frames the decoder couldn't read, skipped (_damaged)
+        self._damaged_since: float | None = None  # when the current run of them began
+        self._stop = False
+        self._go = threading.Event()
+        self.q: queue.Queue = queue.Queue(maxsize=queue_size)
+        self._host = None  # a reusable (pinned, with CUDA) buffer for raw frames on their way to the GPU
 
     # ---- opening
     @classmethod
@@ -821,6 +834,144 @@ class CardSource:
             self._report_sound(final=True)
         print(f"[capture] dropped frames: {self.dropped}"
               + (f", damaged frames from the card skipped: {self.damaged}" if self.damaged else ""))
+
+
+class HdrCardSource(CardSource):
+    """A capture card's 10-bit video (P010, read through Media Foundation: framegen/mf_capture.py), for SmoovPlay's
+    HDR setting. Each frame is read as HDR10 or as SDR, as the card says the console sends it (hdr_of(): an
+    elgato.HdrWatch), or always as HDR10 when the card can't say (hdr_of None: only with HDR set to On, so the player
+    has said the console sends HDR). framegen.hdr.StreamConverter turns it into what set_hdr() asks for: "pq16" for
+    HDR output, or "sdr8". The sound, if any, comes through a DirectShow graph of its own (audio_container), as Media
+    Foundation has the picture, so the two aren't on one clock: sound_late_s() stays 0.
+
+    reader: a mf_capture.P010Reader, or anything with its w, h, fps, stride, get(timeout), close() and dropped."""
+
+    hdr_stream = True  # run.py: SmoovPlay's HDR setting applies to this source
+
+    def __init__(self, reader, name: str, hdr_of=None, test=None, device: str | None = "auto", queue_size: int = 3,
+                 audio_container=None, audio=None) -> None:
+        astream = (audio_container.streams.audio[0] if audio_container is not None and audio is not None
+                   and audio_container.streams.audio else None)
+        self._setup(name, True, test, device, reader.w, reader.h, reader.fps, queue_size, audio, astream)
+        if self.device is None:
+            self.device = "cpu"
+        self.reader, self.container, self.stream = reader, audio_container, None
+        self.raw, self.fmt, self.decode_to = True, "p010", ""
+        self._gpu_jpeg, self._hw = False, None
+        self.bt709, self.full_range = True, False
+        self._hdr_of = hdr_of
+        self.convert = None  # set_hdr(): a framegen.hdr.StreamConverter
+        self._out_ready = threading.Event()
+        how = ("as the card says: " + hdr_of.describe() if hasattr(hdr_of, "describe") else
+               "as the card says" if hdr_of is not None else
+               "always as HDR10, as this card doesn't say when the console sends HDR: keep HDR on on the console")
+        print(f"[capture] {name}: {self.w}x{self.h} 10-bit (P010) at {self.fps:g} fps through Media Foundation, "
+              f"converted on the {'GPU' if self.device == 'cuda' else 'CPU (torch)'}; read {how}")
+        if self.astream is not None:
+            cc = self.astream.codec_context
+            print(f"[capture] sound: {cc.sample_rate} Hz, {cc.channels} channel(s), played on this PC, held back to "
+                  "meet the picture")
+        threading.Thread(target=self._reader, daemon=True, name="capture").start()
+        if self.astream is not None:
+            threading.Thread(target=self._sound_reader, daemon=True, name="capture-sound").start()
+
+    def set_hdr(self, out: str | None, display_peak: float | None = None, why: str = "",
+                sdr_nits: float | None = None) -> None:
+        """What the frames become (run.py, before they start): "pq16" (HDR output), "sdr8", or None, which is "sdr8"
+        here too (why: the reason HDR output isn't used, for the log). sdr_nits: Windows' SDR content brightness: the
+        console's SDR in HDR output is shown as Windows shows SDR apps (StreamConverter), so it looks as it did when
+        the card was read in 8 bits."""
+        from .hdr import StreamConverter
+        if out == "pq16" and hasattr(self._hdr_of, "keep_hdr"):  # the card's own HDR-to-SDR off while we play
+            self._hdr_of.keep_hdr()
+        self.convert = StreamConverter(out or "sdr8", self.device, display_peak=display_peak, sdr_nits=sdr_nits)
+        print("[capture] HDR: " + ("kept HDR for the HDR display" + (
+            f"; the console's SDR goes to it as Windows shows SDR apps (white at {sdr_nits:.0f} nits, sRGB)"
+            if sdr_nits else "")
+            if out == "pq16" else f"shown in SDR{f' ({why})' if why else ''}") + " (HDR is Experimental)")
+        self._out_ready.set()
+
+    def _frames(self):
+        self._out_ready.wait()
+        while not self._stop:
+            try:
+                item = self.reader.get(timeout=0.5)
+            except queue.Empty:  # no frame for a moment (the console switching modes): wait on
+                continue
+            if item is None:
+                raise RuntimeError(self.reader.error or "the card stopped sending video")
+            raw, t_arrival, t_src = item
+            yield self._convert_p010(raw), t_arrival, t_src
+
+    def _convert_p010(self, raw: np.ndarray):
+        """One P010 frame's bytes -> the pipeline's frame, read as HDR10 or SDR (hdr_of)."""
+        import torch
+        from .hdr import P010_HDR10, P010_SDR
+        hdr = self._hdr_of() if self._hdr_of is not None else True
+        if self._host is None or self._host[1].size != raw.size:
+            t = torch.empty(raw.size, dtype=torch.uint8, pin_memory=self.device == "cuda")
+            self._host = (t, t.numpy())
+        t, a = self._host
+        a[:] = raw  # the one copy on the CPU; the upload below finishes before the next frame reuses it
+        h, w = self.h, self.w
+        s = (t.to(self.device).view(torch.int16).view(-1, self.reader.stride // 2).to(torch.int32) & 0xFFFF) >> 6
+        uv = s[h:h + h // 2, :w].reshape(h // 2, w // 2, 2)
+        return self.convert.convert(s[:h, :w].float(), uv[..., 0].float(), uv[..., 1].float(),
+                                    P010_HDR10 if hdr else P010_SDR)
+
+    def _sound_reader(self) -> None:
+        try:
+            for packet in self.container.demux(self.astream):
+                if self._stop:
+                    break
+                self._sound(packet, time.perf_counter())
+        except Exception as e:  # noqa: BLE001 - the sound device went away: the picture goes on
+            if not self._stop:
+                print(f"[capture] the sound stopped: {str(e)[:160]}")
+
+    def close(self) -> None:
+        self._stop = True
+        self._go.set()
+        self._out_ready.set()
+        if hasattr(self._hdr_of, "close"):  # first, the card's tone mapping put back while its video still runs
+            self._hdr_of.close()
+        self.reader.close()
+        if self.container is not None:
+            try:
+                self.container.close()
+            except Exception:  # noqa: BLE001 - closing
+                pass
+        if self.player is not None:
+            self.player.close()
+            self._report_sound(final=True)
+        print(f"[capture] dropped frames: {self.dropped + getattr(self.reader, 'dropped', 0)}")
+
+
+def open_hdr(name: str, w: int, h: int, fps: float, hdr: str, audio_device: str | None = None, audio=None,
+             **kw) -> tuple[HdrCardSource | None, str]:
+    """The card's 10-bit video for SmoovPlay's HDR setting `hdr` (not "off"), or (None, why not, "" when there's
+    nothing to say) for the 8-bit kind (CardSource.open). On Auto only from a card that says whether the console sends
+    HDR (an Elgato HD60 X: framegen/elgato.py), as 10-bit SDR read as HDR10 has the wrong colours; with HDR On
+    (sdr, hdr10) from any card that has it."""
+    from . import elgato
+    from .mf_capture import P010Reader
+    watch = elgato.HdrWatch.open(name)
+    if watch is None and hdr == "auto":
+        return None, ""
+    reader, why = P010Reader.open(name, w, h, fps)
+    if reader is None:
+        if watch is not None:
+            watch.close()
+        return None, why
+    audio_container = None
+    if audio_device and audio is not None:
+        import av
+        try:  # a small sound buffer: DirectShow's default is half a second or more
+            audio_container = av.open(f"audio={audio_device}", format="dshow", options={"audio_buffer_size": "20"})
+        except Exception as e:  # noqa: BLE001 - busy, gone, or no sound: the picture on its own
+            print(f"[capture] couldn't open the sound device ({str(e)[:120]}); playing without sound")
+    return HdrCardSource(reader, f"Capture card ({name})", watch, audio_container=audio_container, audio=audio,
+                         **kw), ""
 
 
 def _cuda_device() -> str | None:
