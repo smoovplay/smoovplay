@@ -44,6 +44,7 @@ namespace SmoovPlay
             public object Default;
             public readonly List<KeyValuePair<object, string>> Choices = new List<KeyValuePair<object, string>>();
             public readonly List<string> Hints = new List<string>();  // a line under each choice ("" = none)
+            public readonly List<string> WhyNot = new List<string>();  // what this PC lacks for each choice (null = nothing)
             public string AppliesKey;  // only used while that setting is one of AppliesValues (null: always)
             public readonly List<object> AppliesValues = new List<object>();
             public readonly List<string> Sources = new List<string>();  // only used with these sources (none: all)
@@ -54,6 +55,14 @@ namespace SmoovPlay
             {
                 int i = Choices.FindIndex(c => Same(c.Key, value));
                 return i >= 0 ? Hints[i] : "";
+            }
+
+            /// <summary>Why this PC can't use a choice as it is now (framegen/settings.py system_limits, read when the
+            /// list loads), or null.</summary>
+            public string WhyNotFor(object value)
+            {
+                int i = Choices.FindIndex(c => Same(c.Key, value));
+                return i >= 0 ? WhyNot[i] : null;
             }
 
             public bool AppliesTo(Func<string, object> value)
@@ -163,6 +172,7 @@ namespace SmoovPlay
                 {
                     s.Choices.Add(new KeyValuePair<object, string>(c["value"], (string)c["name"]));
                     s.Hints.Add(c.ContainsKey("hint") ? c["hint"] as string ?? "" : "");
+                    s.WhyNot.Add(c.ContainsKey("why_not") ? c["why_not"] as string : null);
                 }
                 var applies = d.ContainsKey("applies") ? d["applies"] as Dictionary<string, object> : null;
                 if (applies != null)
@@ -705,7 +715,9 @@ namespace SmoovPlay
                         {
                             bool isOff = rb.Tag == OffTag;
                             bool can = isOff || ok == null || ok.Any(a => Same(a, rb.Tag));
-                            string tip = can ? null : "Not available on this PC right now";
+                            string sysWhy = isOff ? null : spec.WhyNotFor(rb.Tag);  // e.g. HDR output without Windows' HDR
+                            string tip = can ? null : sysWhy ?? "Not available on this PC right now";
+                            if (sysWhy != null && !live) { can = false; tip = sysWhy; }  // (playing, the session says)
                             // Nothing playing: NVIDIA VFG only once it's set up (playing, the session says).
                             string vfgWhy = spec.Key == "model" && Same(rb.Tag, "vfg") && !live ? VfgWhyNot : null;
                             if (vfgWhy != null) { can = false; tip = vfgWhy; }
@@ -727,8 +739,9 @@ namespace SmoovPlay
                     {
                         foreach (var item in row.Items)
                         {
-                            item.IsEnabled = ok == null || ok.Any(a => Same(a, item.Tag));
-                            item.ToolTip = item.IsEnabled ? null : "Not available on this PC right now";
+                            string sysWhy = spec.WhyNotFor(item.Tag);
+                            item.IsEnabled = ok == null ? live || sysWhy == null : ok.Any(a => Same(a, item.Tag));
+                            item.ToolTip = item.IsEnabled ? null : sysWhy ?? "Not available on this PC right now";
                             string vfgWhy = spec.Key == "model" && Same(item.Tag, "vfg") && !live ? VfgWhyNot : null;
                             if (vfgWhy != null) { item.IsEnabled = false; item.ToolTip = vfgWhy; }
                         }

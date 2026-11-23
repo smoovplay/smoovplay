@@ -1150,7 +1150,7 @@ namespace SmoovPlay
         {
             new[] { "Turn on Remote Play", "On the PS5: Settings → System → Remote Play → Enable Remote Play." },
             new[] { "Wire it up if you can", "Remote Play is smoothest with the PC and the PS5 both plugged into the router." },
-            new[] { "Stream at 60 fps", "In chiaki-ng's settings: 1080p and 60 fps. Playing in HDR? Pick the H.265 HDR codec and turn on HDR (Experimental) in SmoovPlay's Settings. SmoovPlay warns you if it's set differently." },
+            new[] { "Stream at 60 fps", "In chiaki-ng's settings: 1080p and 60 fps. With HDR on Auto (the default), SmoovPlay picks the HDR codec when your display has HDR on in Windows. For HDR, turn it on on the PS5 too." },
             new[] { "Pick your frame rate", "On SmoovPlay's Settings page, or with M in the video window: 60, 90 or 120 fps, the upscaler and more." },
             new[] { "Your controller just works", "Plug it into the PC or pair it over Bluetooth. It keeps working while chiaki-ng is minimised." },
         };
@@ -1928,7 +1928,7 @@ namespace SmoovPlay
             new[] { "rest", "Let it wake from rest mode (optional)", "Settings → System → Power Saving → Features Available in Rest Mode: turn on Stay Connected to the Internet and Enable Turning On PS5 from Network.", null },
             new[] { "psn", "Sign in to PSN in chiaki-ng", "Open chiaki-ng. When it asks, sign in to PlayStation Network in the browser window it opens, then paste the address you land on back into chiaki-ng.", "chiaki" },
             new[] { "register", "Register your PS5", "chiaki-ng finds consoles on your network. Click the one marked Automatic Registration Available and choose Yes. Not offered? Use a PIN from the PS5: Settings → System → Remote Play → Link Device.", null },
-            new[] { "video", "Stream at 60 fps", "In chiaki-ng's settings, under Video: resolution 1080p (720p on a weak connection) and 60 fps. For HDR, pick the H.265 HDR codec and turn on HDR (Experimental) in SmoovPlay's Settings (Picture); otherwise pick a codec without HDR. SmoovPlay warns you if it's set differently.", null },
+            new[] { "video", "Stream at 60 fps", "In chiaki-ng's settings, under Video: resolution 1080p (720p on a weak connection) and 60 fps. With HDR on Auto (the default), SmoovPlay picks the H.265 HDR codec itself when you press Play, if your display has Use HDR on in Windows; with HDR off, pick a codec without HDR. For HDR, also turn it on on the PS5: Settings → Screen and Video → Video Output → HDR.", null },
             new[] { "hdcp", "Black picture? Turn off HDCP", "Only if you need it: if the picture stays black, or the PS5 says the content can't be shown, go to Settings → System → HDMI on the PS5, turn off Enable HDCP and connect again. Video apps like Netflix need HDCP, so turn it back on when you're done playing.", null },
             new[] { "controller", "Connect your controller", "Plug it into the PC with USB or pair it over Bluetooth. It keeps working while chiaki-ng is minimised.", null },
             new[] { "play", "Press Play", "Always start from SmoovPlay: press Play, then connect to your PS5 in chiaki-ng. The smooth video opens in its own window.", "play" },
@@ -1946,7 +1946,7 @@ namespace SmoovPlay
         {
             new[] { "capture-wire", "Connect the card", "The console's HDMI output goes into the card's HDMI input, and the card into this PC: USB 3 (a blue port) or a PCIe slot. A card with an HDMI output can pass the picture on to your TV too.", null },
             new[] { "capture-hdcp", "Turn off HDCP on a PS5", "On the PS5: Settings → System → HDMI → turn off Enable HDCP. With it on, the card only gets a blank picture. Turn it back on when you're done: video apps like Netflix need it. Xbox and Switch games don't need this.", null },
-            new[] { "capture-mode", "1080p, 60 Hz, HDR off", "Set the console's video output to 1080p at 60 Hz, with HDR off. SmoovPlay expects a 60 Hz signal, in which a 30 fps game shows each frame twice. Picked a higher Capture card resolution in Settings (Experimental)? Set the console to that instead.", null },
+            new[] { "capture-mode", "1080p, 60 Hz, HDR as your card allows", "Set the console's video output to 1080p at 60 Hz. SmoovPlay expects a 60 Hz signal, in which a 30 fps game shows each frame twice. Picked a higher Capture card resolution in Settings (Experimental)? Set the console to that instead. HDR: an Elgato HD60 X tells SmoovPlay when the console sends HDR, so with HDR on Auto (the default, NVIDIA cards) the console's HDR can stay on. With other cards, turn HDR off on the console, unless you set SmoovPlay's HDR to On.", null },
             new[] { "capture-sound", "Sound and controller", "Your controller stays connected to the console as usual. SmoovPlay plays the card's sound on this PC, held back to meet the smooth picture. If you'd rather listen through the card's HDMI output, pick no sound for the card on the Play page.", null },
             new[] { "capture-play", "Press Play", "The smooth video from the card opens in its own window.", "play" },
         };

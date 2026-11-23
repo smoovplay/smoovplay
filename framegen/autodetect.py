@@ -272,10 +272,12 @@ def _fps(hz: int) -> str:
 
 
 def recommend(current: dict, timing: dict, display: Display | None, *, gpu: str = "", trt: bool = False,
-              vsr: str | None = None, busy: int | None = None, vfg: dict | None = None, vfg_why: str = "") -> dict:
+              vsr: str | None = None, busy: int | None = None, vfg: dict | None = None, vfg_why: str = "",
+              hdr_display: bool = False) -> dict:
     """Settings for this PC. current: the settings now (Settings.values()); timing: time_rife()'s result; vsr: why
     RTX VSR can't be used, or None if it can; busy: how busy the card was before the test (%); vfg: time_vfg()'s
-    result if NVIDIA VFG is set up, else None, with vfg_why saying why.
+    result if NVIDIA VFG is set up, else None, with vfg_why saying why; hdr_display: the main display has Windows'
+    HDR on.
     Returns {"settings": {key: value}, "reasons": {key: text}, "notes": [text]}; only frame generation and picture
     settings are suggested, the rest are left as they are. NVIDIA VFG is suggested when it's set up and keeps up at
     least as high a frame rate as RIFE: setting it up is the user's choice to use it."""
@@ -303,10 +305,13 @@ def recommend(current: dict, timing: dict, display: Display | None, *, gpu: str 
     rife = BY_KEY["model"].default
     vfg_pick = next(((h, q) for h in (120, 90, 60) if h <= top for q in VFG_QUALITIES if vfg_fits(h, q)),
                     None) if vfg else None
+    dml = timing["full"].get("engine") == "dml"
     if vfg_pick is not None and vfg_pick[0] >= hz:
+        _hdr(settings, reasons, current=current, hdr_display=hdr_display, dml=dml)
         return _recommend_vfg(vfg_pick, vfg, hz, settings, reasons, notes, current=current, rate=rate, top=top,
                               share=share, fsr_ms=fsr_ms, speed=speed, pixels=pixels, enlarge=enlarge, vsr=vsr,
                               display=display, busy=busy)
+    _hdr(settings, reasons, current=current, hdr_display=hdr_display, dml=dml)
     if vfg:
         settings["model"] = rife
         reasons["model"] = (f"NVIDIA VFG is set up, but it only keeps up at {_fps(vfg_pick[0])} on this graphics "
@@ -400,6 +405,16 @@ def _recommend_vfg(pick: tuple, vfg: dict, rife_hz: int, settings: dict, reasons
               speed=speed, pixels=pixels, enlarge=enlarge, vsr=vsr, display=display)
     _notes(notes, settings, display=display, hz=hz, rate=rate, share=share, busy=busy)
     return {"settings": settings, "reasons": reasons, "notes": notes}
+
+
+def _hdr(settings: dict, reasons: dict, *, current: dict, hdr_display: bool, dml: bool) -> None:
+    """HDR: Auto, for a player still on Off (the default before Auto). Not without an NVIDIA card, which it needs."""
+    if dml or current.get("hdr") != "off":
+        return
+    settings["hdr"] = "auto"
+    reasons["hdr"] = ("Auto turns HDR on by itself for a PS5 streaming in HDR, and picks chiaki-ng's codec to match: "
+                      + ("this display has Use HDR on in Windows, so the picture stays HDR all the way." if hdr_display
+                         else "this display doesn't have HDR on in Windows, so an HDR stream is fitted to it."))
 
 
 def _upscaler(settings: dict, reasons: dict, *, current: dict, hz: int, left: float, fsr_ms: float, speed: float,
@@ -526,9 +541,17 @@ def detect(current: dict, log: Callable[[str], None] = print, timing: dict | Non
         except Exception as e:  # noqa: BLE001 - a broken VFG install mustn't stop the rest of the test
             vfg_why = f"NVIDIA VFG couldn't start: {str(e)[:160]}"
             log(vfg_why)
+    hdr_display = False  # the main display has Windows' HDR on (HDR output and Auto use it)
+    if sys.platform == "win32":
+        try:
+            from .dxgi_present import display_hdr
+            d = display_hdr()
+            hdr_display = bool(d and d["hdr"])
+        except Exception:  # noqa: BLE001 - can't tell: as without HDR
+            pass
     log("choosing settings")
     result = recommend(current, timing, display, gpu=gpu, trt=trt, vsr=vsr, busy=smi.get("busy"), vfg=vfg,
-                       vfg_why=vfg_why)
+                       vfg_why=vfg_why, hdr_display=hdr_display)
 
     name = gpu.replace("NVIDIA ", "").replace("GeForce ", "")
     engines = {"trt": "TensorRT", "torch": "PyTorch", "dml": "DirectML (Experimental)"}
@@ -540,7 +563,8 @@ def detect(current: dict, log: Callable[[str], None] = print, timing: dict | Non
          "detail": f"Full motion detail, {engines[full['engine']]}{' (estimated)' if full['estimated'] else ''}. "
                    f"Half: {half['ms']:.1f} ms, {engines[half['engine']]}."},
         {"label": "Display", "value": f"{display.width}×{display.height} at {display.hz} Hz" if display else "Unknown",
-         "detail": f"Can run at {display.max_hz} Hz" if display and display.max_hz > display.hz + 5 else ""},
+         "detail": "; ".join(x for x in (f"Can run at {display.max_hz} Hz" if display and display.max_hz > display.hz + 5
+                                         else "", "HDR on in Windows" if hdr_display else "") if x)},
         {"label": "TensorRT", "value": "NVIDIA cards only" if dml_mode else "Installed" if trt else "Not installed",
          "detail": ""},
         {"label": "RTX VSR", "value": "NVIDIA cards only" if dml_mode else "Ready" if vsr is None else "Not set up",

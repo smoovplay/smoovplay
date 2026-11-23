@@ -77,8 +77,12 @@ Any 60 fps gameplay recording works for testing; the examples use `testdata\clip
 `scripts/frametap_fake.py testdata\clip_1080p60.mp4 --native` stands in for a PS5 running a 60 fps game, so test
 mode can be tried without a console.
 
-**HDR** (Experimental: [`framegen/hdr.py`](../framegen/hdr.py), setting `hdr`, `--hdr off|sdr|hdr10`) only changes anything for a
-chiaki-ng stream in HDR (codec H.265 HDR: 10-bit HEVC, PQ, BT.2020) with the setting on. `sdr` tone-maps it to 8-bit
+**HDR** (Experimental: [`framegen/hdr.py`](../framegen/hdr.py), setting `hdr`, `--hdr auto|off|sdr|hdr10`) only changes anything for a
+chiaki-ng stream in HDR (codec H.265 HDR: 10-bit HEVC, PQ, BT.2020) with the setting on. `auto` (the default) is
+`hdr10` on a display with Windows' HDR on and `sdr` on any other, and before chiaki-ng starts,
+[`framegen/chiaki_settings.py`](../framegen/chiaki_settings.py) switches its PS5 codec in the registry to H.265 HDR
+with Windows' HDR on (and always with `sdr` or `hdr10`). It never switches it back, as chiaki-ng's settings are shared
+with any separate install; `off` leaves it alone (`FRAMEGEN_CHIAKI_CODEC=0` too). HDR output is greyed out without Windows' HDR on (`settings.system_limits`). `sdr` tone-maps it to 8-bit
 SDR as it's decoded (BT.2390 roll-off, SDR white at 203 nits), so everything after that is unchanged. `hdr10` keeps
 the frames HDR10 as half floats through RIFE and FSR 1 into a 10-bit DXGI swap chain in HDR10's colour space; it
 needs a display with Windows' HDR on, and falls back to `sdr` without one. To try it without a PS5 or an HDR display:
@@ -92,6 +96,22 @@ $env:FRAMEGEN_HDR_FORCE = "1"; $env:FRAMEGEN_PRESENT_SNAP = "out\hdr_snaps"   # 
 The snapshots are 16-bit PNGs of the PQ values in the back buffer (what an HDR display would get). Also:
 `FRAMEGEN_HDR_PEAK` (the source's brightest highlights, default 1000 nits) and `FRAMEGEN_HDR_SDR_NITS` (SDR white,
 default 203).
+
+**HDR through a capture card** ([`framegen/capture.py`](../framegen/capture.py) `open_hdr`, `HdrCardSource`), with
+the setting on and an NVIDIA card. FFmpeg's DirectShow input can't capture P010, so a card's 10-bit video comes
+through Windows Media Foundation instead ([`framegen/mf_capture.py`](../framegen/mf_capture.py), ctypes), and its
+sound through a DirectShow graph of its own. The card's colour tags are the same whether the console sends HDR10 or
+SDR, and each read as the other looks wrong (SDR as HDR10: too bright and oversaturated), so how to read each frame
+comes from the card: an Elgato HD60 X reports its HDMI input over its vendor HID interface
+([`framegen/elgato.py`](../framegen/elgato.py), read as in Elgato's MIT sample code). Its documented HDR infoframe
+register keeps the last HDR packet after a PS5 leaves HDR, so the input-signal register (0x00, byte 8) is read
+instead, every half second. The HD60 X also tone-maps HDR to SDR itself by default (register 0x0A), in every
+format, so frames are HDR10 only with HDR coming in and that off: for HDR output SmoovPlay turns it off while it
+plays and puts it back when it closes. With it off, the card's P010 matched a PS5's Remote Play HDR stream of the
+same screen to about 2 codes in 1023, and its SDR, shown as Windows shows SDR apps, matched Remote Play's picture
+of it. `auto` takes the 10-bit video only from such a card; `sdr` and `hdr10` from any card that has it at the size asked for, read as HDR10 when the card can't say.
+Otherwise the card is read in 8 bits as before. `python -m framegen.elgato` prints what an HD60 X reports, and `python -m framegen.mf_capture "<card>"` its
+formats as Media Foundation lists them.
 
 Other tools: `scripts/benchmark.py` (GPU timing per model and resolution), `scripts/bench_120.py` (30 → 120 speed
 and quality), `scripts/check_fast.py` (checks the optimised forward pass against the reference), `scripts/latency_video.py`
@@ -336,15 +356,17 @@ Timing from a recorded clip, not a live stream, paced at 60 Hz with the OpenGL w
 <summary><b>Known limits</b></summary>
 
 - **Capture cards are Experimental.** A player's AVerMedia Live Gamer 4K (GC573) works since 0.3.1, its sound from
-  0.3.2 (not yet confirmed); other cards are tested with recordings standing in for one (`--capture`). On a PS5, turn off HDCP while you use the card (Settings → System → HDMI) and keep it at 60 Hz, not 120 Hz.
+  0.3.2 (not yet confirmed), and a contributor's Elgato HD60 X with a PS5, HDR included; other cards are tested with
+  recordings standing in for one (`--capture`). On a PS5, turn off HDCP while you use the card (Settings → System → HDMI) and keep it at 60 Hz, not 120 Hz.
 - **Window capture is Experimental.** Not yet confirmed with a real game stream; 0.3.1 recognises the current Xbox
   app. The app's sound comes ahead of the smooth
   picture and its window has to stay visible. In Windows HDR mode, on a rotated monitor or without an NVIDIA card,
   frames go through the CPU instead (a few ms more).
 - **HDR is Experimental.** A contributor has played a real PS5 HDR stream with HDR output on an HDR monitor
   (Windows 11, RTX 5070 Ti). The tests use a stand-in HDR stream (`frametap_fake.py --hdr`) and read back the 10-bit
-  buffer HDR output presents (on an SDR display, with `FRAMEGEN_HDR_FORCE=1`). Capture cards and window capture
-  stay SDR.
+  buffer HDR output presents (on an SDR display, with `FRAMEGEN_HDR_FORCE=1`). Through a capture card, a contributor
+  has tried a PS5 with its HDR on and off through an Elgato HD60 X; other cards with 10-bit video are read as HDR10
+  only with HDR set to On, untried. Window capture stays SDR.
 - **4K** input doesn't fit in real time, even with TensorRT.
 - **90/120 Hz to a file** (`--out`) isn't supported; those rates are window-only.
 - **Soft scene cuts** between two dark shots can occasionally slip past the cut detector and show one blended frame.
@@ -368,11 +390,17 @@ Timing from a recorded clip, not a live stream, paced at 60 Hz with the OpenGL w
   frames before it are shown. When the graphics card falls behind for a moment, SmoovPlay drops to 60 fps rather
   than add delay.
 - **1080p.** Remote Play arrives at 1080p, so the picture is a little softer than HDMI straight from the console.
-- **HDR** (*Experimental*, Settings → HDR, off by default). For a PS5 streaming in HDR: pick the H.265 HDR codec in
-  chiaki-ng, then turn HDR on. **On, shown in SDR** gives the stream its real colours on any monitor. **On, HDR
-  output** keeps it HDR all the way to a monitor with Windows' HDR on, with Looks and RTX VSR off. A contributor has
-  played a real PS5 HDR stream this way on an HDR monitor, and since 0.3.2 fullscreen keeps Windows' HDR on instead
-  of switching the display to SDR. Instant replay clips are saved in SDR either way.
+- **HDR** (*Experimental*, Settings → HDR, **Auto** by default). With **Use HDR** on in Windows' display settings,
+  Auto picks chiaki-ng's H.265 HDR codec and keeps a PS5's HDR all the way to your monitor, with Looks and RTX VSR
+  off. Turn on HDR on the PS5 too (Settings → Screen and Video → Video Output → HDR). On a display without HDR, an
+  HDR stream is fitted to it, and chiaki-ng's codec is left as it is. **On, shown in SDR** always fits HDR to the
+  monitor, and **Off** leaves HDR and chiaki-ng's codec alone. A contributor has played a real PS5 HDR stream on an
+  HDR monitor, and since 0.3.2 fullscreen keeps Windows' HDR on instead of switching the display to SDR. Instant
+  replay clips are saved in SDR either way. Through a capture card, Auto reads an Elgato HD60 X's 10-bit video,
+  as HDR or SDR as the card reports the console's signal, so the console's HDR can stay on or off; a contributor
+  has tried a PS5 that way with both. For HDR output SmoovPlay turns the card's own HDR-to-SDR tone mapping off
+  while it plays, and back on when it closes. Other cards stay 8-bit on Auto: turn HDR off on the console, or set HDR to
+  On, which reads a card's 10-bit video as HDR, and keep the console's HDR on.
 - **Some wobble.** HUD text over fast motion, very fast camera turns and thin objects crossing each other can wobble
   a little. Press **I** in the video window to compare with frame generation off.
 - **Sound and picture stay in step.** chiaki-ng plays the sound, and SmoovPlay tells it to hold the sound back

@@ -78,7 +78,7 @@ The launcher opens on this page the first time it runs. It has eight steps the u
 2. Rest-mode settings (optional).
 3. Sign in to PSN in chiaki-ng.
 4. Register the PS5, automatically or with a PIN.
-5. Set the stream to 60 fps (the H.265 HDR codec only with HDR on in SmoovPlay's Settings).
+5. Set the stream to 60 fps. With HDR on Auto (the default), SmoovPlay switches chiaki-ng to the H.265 HDR codec when Play starts and Windows' HDR is on; it never switches it back.
 6. Black picture? Turn off HDCP (only if needed). If the picture stays black, or the PS5 says the content can't be shown, turn off Enable HDCP (PS5: Settings → System → HDMI), and turn it back on afterwards for video apps like Netflix.
 7. Connect a controller.
 8. Press Play.

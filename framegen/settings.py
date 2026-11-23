@@ -204,17 +204,19 @@ SPECS: tuple[Spec, ...] = (
                  "speed": "Each step up asks more of the GPU."}),
     # framegen/hdr.py. Off by default, and then nothing changes: an HDR stream comes out washed out, and SmoovPlay says
     # so. "hdr10" needs the DXGI presentation (NVIDIA) and Windows' HDR; without them run.py uses "sdr" for the session.
-    Spec("hdr", "HDR", ("off", "sdr", "hdr10"), "off",
-         {"off": "Off", "sdr": "On, shown in SDR", "hdr10": "On, HDR output"}, live=False,
+    Spec("hdr", "HDR", ("auto", "off", "sdr", "hdr10"), "auto",
+         {"auto": "Auto", "off": "Off", "sdr": "On, shown in SDR", "hdr10": "On, HDR output"}, live=False,
          group="Picture", experimental=True,
-         hints={"off": "For a stream without HDR. The default.",
+         hints={"auto": "HDR output on a display with Use HDR on in Windows (chiaki-ng switched to its HDR codec), "
+                        "shown in SDR on any other. The default.",
+                "off": "Leaves HDR alone: chiaki-ng's codec as you set it, a capture card read in 8 bits.",
                 "sdr": "Plays an HDR stream on any display, with its colours and brightness fitted to it.",
-                "hdr10": "Keeps it HDR on an HDR display, with Use HDR on in Windows' display settings. Not yet "
-                         "tried on an HDR screen."},
-         help="Experimental: not yet tried with a real PS5 HDR stream, or on an HDR screen. For Remote Play in HDR, "
-              "pick the H.265 HDR codec in chiaki-ng, then turn this on. Shown in SDR fits HDR to any display. HDR "
-              "output keeps it HDR on a display with Use HDR on in Windows (without one, it's shown in SDR). A "
-              "stream without HDR isn't changed. Applies the next time you press Play.",
+                "hdr10": "Keeps it HDR on an HDR display, with Use HDR on in Windows' display settings. Tried "
+                         "with a real PS5 on an HDR monitor."},
+         help="Experimental. Auto keeps the PS5's HDR all the way to a display with Use HDR on in Windows, and fits "
+              "it to any other: chiaki-ng is switched to its H.265 HDR codec, and an Elgato HD60 X is read in 10 "
+              "bits. On always asks for HDR, from other capture cards too (keep HDR on on the console). A stream "
+              "without HDR isn't changed. Applies the next time you press Play.",
          impact={"picture": "An HDR stream's true colours, instead of a washed-out picture.",
                  "speed": "About 0.7 ms of graphics card time for each frame from the game."}),
     # run.py asks the card for this size (framegen/capture.py pick_mode: else the largest it has under it). Every new
@@ -433,9 +435,30 @@ class Settings:
             print(f"[settings] couldn't save {self.path}: {e}")
 
 
-def specs_json(specs: tuple[Spec, ...] = SPECS) -> dict:
+HDR10_NEEDS = "Needs a display with Use HDR on in Windows' display settings."
+
+
+def system_limits() -> dict:
+    """Choices this PC can't use as it is now, with why: {key: {value: reason}}. The launcher's Settings page greys
+    them out (from python -m framegen.settings), and so does the video window's menu (run.py). Only what's quick to
+    tell: HDR output needs the main display to have Windows' HDR on."""
+    limits: dict = {}
+    if os.name == "nt":
+        try:
+            from .dxgi_present import display_hdr
+            d = display_hdr()
+            if d is not None and not d["hdr"]:
+                limits["hdr"] = {"hdr10": HDR10_NEEDS}
+        except Exception:  # noqa: BLE001 - can't tell: nothing is greyed out
+            pass
+    return limits
+
+
+def specs_json(specs: tuple[Spec, ...] = SPECS, limits: dict | None = None) -> dict:
     """The registry for the launcher's Settings page: every setting with its choices in display order, and where the
-    saved file is. Values are JSON types; the launcher sends a choice back exactly as given here."""
+    saved file is. Values are JSON types; the launcher sends a choice back exactly as given here. limits:
+    system_limits(), a choice's "why_not" (what this PC lacks for it)."""
+    limits = limits or {}
     return {
         "path": str(DEFAULT_PATH),
         "impact_pc": IMPACT_PC,
@@ -445,10 +468,12 @@ def specs_json(specs: tuple[Spec, ...] = SPECS) -> dict:
                    "sources": list(s.sources) or None,
                    "elsewhere": s.elsewhere or None,
                    "applies": {"key": s.applies[0], "values": list(s.applies[1])} if s.applies else None,
-                   "choices": [{"value": v, "name": s.name(v), "hint": s.hints.get(v, "")} for v in s.choices]}
+                   "choices": [{"value": v, "name": s.name(v), "hint": s.hints.get(v, ""),
+                                **({"why_not": limits[s.key][v]} if v in limits.get(s.key, {}) else {})}
+                               for v in s.choices]}
                   for s in specs],
     }
 
 
 if __name__ == "__main__":
-    print(json.dumps(specs_json()))
+    print(json.dumps(specs_json(limits=system_limits())))

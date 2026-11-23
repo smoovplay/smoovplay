@@ -224,6 +224,23 @@ def test_specs_json_is_what_the_launcher_needs():
     assert next(c for c in sharp["choices"] if c["name"] == "High")["hint"] == ""  # not every choice needs one
 
 
+def test_hdr_is_auto_by_default_and_hdr_output_says_what_it_needs(monkeypatch):
+    from framegen import dxgi_present, settings
+    from framegen.settings import HDR10_NEEDS, specs_json, system_limits
+    assert BY_KEY["hdr"].default == "auto" and Settings().hdr == "auto"
+    assert Settings({"hdr": "off"}).hdr == "off"  # a saved choice is kept (Auto-detect suggests Auto instead)
+    hdr = next(s for s in specs_json(limits={"hdr": {"hdr10": HDR10_NEEDS}})["specs"] if s["key"] == "hdr")
+    assert [c.get("why_not") for c in hdr["choices"]] == [None, None, None, HDR10_NEEDS]
+    assert all("why_not" not in c for s in specs_json()["specs"] for c in s["choices"])
+    monkeypatch.setattr(settings.os, "name", "nt")
+    monkeypatch.setattr(dxgi_present, "display_hdr", lambda hwnd=None: {"hdr": False})
+    assert system_limits() == {"hdr": {"hdr10": HDR10_NEEDS}}
+    monkeypatch.setattr(dxgi_present, "display_hdr", lambda hwnd=None: {"hdr": True})
+    assert system_limits() == {}
+    monkeypatch.setattr(dxgi_present, "display_hdr", lambda hwnd=None: None)  # can't tell: nothing greyed out
+    assert system_limits() == {}
+
+
 def test_hints_are_for_real_choices_and_short():
     for s in SPECS:
         assert set(s.hints) <= set(s.choices), s.key

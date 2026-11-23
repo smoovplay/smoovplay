@@ -214,6 +214,16 @@ def test_source_plays_a_raw_file_like_a_card(tmp_path, device):
     assert np.array_equal(frames[0], frames[1])  # a repeat stays bit-identical through the conversion
 
 
+@pytest.mark.parametrize("found, said", [(None, "CPU (OpenCV)"), ("cpu", "CPU (torch)")])
+def test_an_auto_device_is_used_and_said_as_worked_out(tmp_path, monkeypatch, capsys, found, said):
+    monkeypatch.setattr(c, "_cuda_device", lambda: found)
+    a, _ = _blocks()
+    src = c.CardSource.raw_file(_raw_file(tmp_path, [a]), a.shape[1], a.shape[0], "nv12")  # device="auto"
+    assert len(list(src)) == 1
+    src.close()
+    assert src.device == found and f"converted on {said}" in capsys.readouterr().out
+
+
 def test_source_test_mode_and_yuy2(tmp_path):
     from framegen.sources import TestMode
     frames = [_blocks(seed=s)[0] for s in range(10, 18)]

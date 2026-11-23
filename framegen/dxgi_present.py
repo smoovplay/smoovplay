@@ -228,9 +228,52 @@ def _nvidia_adapter(factory: c_void_p) -> c_void_p:
         i += 1
 
 
+class _Luid(ctypes.Structure):
+    _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_int32)]
+
+
+class _DcHeader(ctypes.Structure):  # DISPLAYCONFIG_DEVICE_INFO_HEADER
+    _fields_ = [("type", ctypes.c_uint32), ("size", ctypes.c_uint32), ("adapter", _Luid), ("id", ctypes.c_uint32)]
+
+
+class _DcPath(ctypes.Structure):  # DISPLAYCONFIG_PATH_INFO: source (adapter, id, mode, flags), target, flags
+    _fields_ = [("src_adapter", _Luid), ("src_id", ctypes.c_uint32), ("src_rest", ctypes.c_uint32 * 2),
+                ("tgt_adapter", _Luid), ("tgt_id", ctypes.c_uint32), ("tgt_rest", ctypes.c_uint32 * 9),
+                ("flags", ctypes.c_uint32)]
+
+
+def sdr_white_nits() -> dict:
+    """Windows' "SDR content brightness" for each display with HDR on: what SDR apps' white is shown at, in nits,
+    by display name ("\\\\.\\DISPLAY1"). {} if Windows can't say (before Windows 10 1709, or no display config)."""
+    out: dict = {}
+    try:
+        u32 = ctypes.WinDLL("user32")
+        n_paths, n_modes = c_uint(), c_uint()
+        if u32.GetDisplayConfigBufferSizes(2, byref(n_paths), byref(n_modes)) != 0:  # QDC_ONLY_ACTIVE_PATHS
+            return out
+        paths, modes = (_DcPath * n_paths.value)(), (ctypes.c_ubyte * (64 * n_modes.value))()
+        if u32.QueryDisplayConfig(2, byref(n_paths), paths, byref(n_modes), modes, None) != 0:
+            return out
+        for p in paths[:n_paths.value]:
+            class Source(ctypes.Structure):  # DISPLAYCONFIG_SOURCE_DEVICE_NAME
+                _fields_ = [("header", _DcHeader), ("name", ctypes.c_wchar * 32)]
+
+            class White(ctypes.Structure):  # DISPLAYCONFIG_SDR_WHITE_LEVEL: 1000 is 80 nits
+                _fields_ = [("header", _DcHeader), ("level", ctypes.c_uint32)]
+            src = Source(_DcHeader(1, ctypes.sizeof(Source), p.src_adapter, p.src_id))  # GET_SOURCE_NAME
+            white = White(_DcHeader(11, ctypes.sizeof(White), p.tgt_adapter, p.tgt_id))  # GET_SDR_WHITE_LEVEL
+            if u32.DisplayConfigGetDeviceInfo(byref(src)) == 0 and u32.DisplayConfigGetDeviceInfo(byref(white)) == 0 \
+                    and white.level:
+                out[src.name] = white.level * 80.0 / 1000.0
+    except (OSError, AttributeError):
+        pass
+    return out
+
+
 def outputs() -> list[dict]:
     """Every display Windows has, from DXGI: {"name", "monitor" (HMONITOR), "hdr" (Windows' HDR is on for it),
-    "bits", "max_nits", "min_nits", "full_frame_nits", "rect" (left, top, right, bottom)}. [] if DXGI can't say."""
+    "bits", "max_nits", "min_nits", "full_frame_nits", "rect" (left, top, right, bottom), "sdr_nits" (Windows' SDR
+    content brightness on it, or None: sdr_white_nits)}. [] if DXGI can't say."""
     found = []
     try:
         dxgi = ctypes.WinDLL("dxgi")
@@ -268,6 +311,10 @@ def outputs() -> list[dict]:
             i += 1
     finally:
         _release(factory)
+    if found:
+        whites = sdr_white_nits()
+        for o in found:
+            o["sdr_nits"] = whites.get(o["name"])
     return found
 
 
