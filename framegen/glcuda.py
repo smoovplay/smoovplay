@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import glob
 import os
+import sys
 
 import torch
 
@@ -19,11 +20,20 @@ _GL_TEXTURE_2D = 0x0DE1
 
 
 def cudart_path() -> str:
-    """PyTorch's CUDA runtime DLL (cudart64_*.dll)."""
-    libdir = os.path.join(os.path.dirname(torch.__file__), "lib")
-    for path in sorted(glob.glob(os.path.join(libdir, "cudart64_*.dll"))):
-        return path
-    raise OSError("PyTorch's CUDA runtime (cudart64_*.dll) not found")
+    """PyTorch's CUDA runtime: cudart64_*.dll beside torch on Windows; on Linux, the libcudart.so PyTorch has
+    already loaded (it ships in the nvidia-cuda-runtime wheel, or in torch/lib for some builds)."""
+    if sys.platform == "win32":
+        libdir = os.path.join(os.path.dirname(torch.__file__), "lib")
+        for path in sorted(glob.glob(os.path.join(libdir, "cudart64_*.dll"))):
+            return path
+        raise OSError("PyTorch's CUDA runtime (cudart64_*.dll) not found")
+    torch.cuda.init()
+    with open("/proc/self/maps") as maps:
+        for line in maps:
+            path = line.split()[-1]
+            if "/libcudart.so" in path:
+                return path
+    raise OSError("PyTorch's CUDA runtime (libcudart.so) isn't loaded")
 
 
 def _cudart() -> ctypes.CDLL:
