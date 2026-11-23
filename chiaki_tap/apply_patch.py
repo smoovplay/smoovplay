@@ -24,7 +24,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 MARK = "FrameTapSession::"  # this version's edits are in
 OLD_MARK = "frametap"  # an older version's are (its code was inside streamsession.cpp)
-FILES = {"frametap.h": "include", "frametap_session.h": "include", "frametap.c": "src", "frametap_session.cpp": "src"}
+FILES = {"frametap.h": "include", "frametap_posix.h": "include", "frametap_session.h": "include", "frametap.c": "src",
+         "frametap_session.cpp": "src"}
 
 EDITS = [
     ("#include <streamsession.h>\n",

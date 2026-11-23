@@ -7,7 +7,17 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <time.h>
+static void Sleep(unsigned ms)
+{
+	struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
+	nanosleep(&ts, NULL);
+}
+#define _putenv putenv
+#endif
 
 int main(void)
 {

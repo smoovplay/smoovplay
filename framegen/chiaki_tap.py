@@ -13,14 +13,12 @@ Compared with a capture card, each frame also carries what the stream knows abou
     scenes).
   - damaged: frames were lost before this one, or it's the PS5's recovery frame after a loss. The pipeline
     holds instead of interpolating, so a broken frame isn't smeared into the generated one.
-Windows only (named file mapping + named event).
+Windows and Linux: the operating system parts are in tapsys.py.
 """
 
 from __future__ import annotations
 
 import csv
-import ctypes
-import mmap
 import queue
 import struct
 import sys
@@ -35,6 +33,7 @@ import numpy as np
 from .io import Tick
 from .streamcheck import StreamCheck
 from .sync import CAPTURE_LOCK
+from .tapsys import Signal, open_map, qpc, qpc_freq
 
 NAME = "Local\\chiaki-frametap"
 EVENT_NAME = "Local\\chiaki-frametap-frame"
@@ -80,19 +79,6 @@ AUDIO_HEADER, AUDIO_SLOT_HEADER, AUDIO_SLOTS, AUDIO_SLOT_SIZE = 64, 32, 512, 819
 AUDIO_TOTAL = AUDIO_HEADER + AUDIO_SLOTS * AUDIO_SLOT_SIZE
 BUTTON_OPTIONS, BUTTON_PS = 1 << 12, 1 << 15  # ChiakiControllerButton
 
-if sys.platform == "win32":
-    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    _k32.CreateEventW.restype = ctypes.c_void_p
-    _k32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
-    _k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-    _k32.SetEvent.argtypes = [ctypes.c_void_p]
-    _k32.CloseHandle.argtypes = [ctypes.c_void_p]
-
-
-def qpc() -> int:
-    v = ctypes.c_int64()
-    _k32.QueryPerformanceCounter(ctypes.byref(v))
-    return v.value
 
 
 @dataclass
@@ -132,10 +118,8 @@ class FrameTap:
     """The shared ring. Either side may create it first; both see the same memory."""
 
     def __init__(self, name: str = NAME, event_name: str = EVENT_NAME) -> None:
-        if sys.platform != "win32":
-            raise RuntimeError("the chiaki frame tap is Windows-only")
-        self.mm = mmap.mmap(-1, TOTAL, tagname=name)
-        self.event = _k32.CreateEventW(None, 0, 0, event_name)
+        self.mm = open_map(name, TOTAL)
+        self.event = Signal(self.mm, event_name)
 
     def header(self) -> Header:
         magic, version, n, size, codec, w, h, fps = struct.unpack_from("<8I", self.mm, 0)
@@ -179,7 +163,7 @@ class FrameTap:
         struct.pack_into("<I", self.mm, 88, max(0, min(500, int(ms))))
 
     def wait(self, timeout_s: float) -> None:
-        _k32.WaitForSingleObject(self.event, int(timeout_s * 1000))
+        self.event.wait(timeout_s)
 
     def read(self, seq: int, qpc_freq: int, slots: int = SLOTS, slot_size: int = SLOT_SIZE,
              into=None) -> Packet | None:
@@ -212,15 +196,14 @@ class FrameTap:
         """Start a stream. A decoded format (RAW_CODECS) gets version 2 and slots of its own (raw_layout).
         features, if given, replaces the header's features field."""
         struct.pack_into("<I", self.mm, 0, 0)
-        freq = ctypes.c_int64()
-        _k32.QueryPerformanceFrequency(ctypes.byref(freq))
+        freq = qpc_freq()
         if codec in RAW_CODECS:
             version, (self._slots, self._slot_size) = VERSION_RAW, raw_layout(RAW_CODECS[codec], width, height)
         else:
             version, self._slots, self._slot_size = VERSION, SLOTS, SLOT_SIZE
         struct.pack_into("<7I", self.mm, 4, version, self._slots, self._slot_size, codec, width, height, max_fps)
         struct.pack_into("<QI", self.mm, 32, 0, 0)
-        struct.pack_into("<Q", self.mm, 48, freq.value)
+        struct.pack_into("<Q", self.mm, 48, freq)
         struct.pack_into("<I", self.mm, 92, colour if codec in RAW_CODECS else 0)
         if features is not None:
             struct.pack_into("<I", self.mm, 64, features)
@@ -244,7 +227,7 @@ class FrameTap:
             self.mm[off + SLOT_HEADER: off + SLOT_HEADER + size] = bytes(data[:size])
         struct.pack_into("<Q", self.mm, off, seq)
         struct.pack_into("<Q", self.mm, 32, seq + 1)
-        _k32.SetEvent(self.event)
+        self.event.set()
 
     def take_idr_request(self) -> bool:
         (r,) = struct.unpack_from("<I", self.mm, 40)
@@ -272,10 +255,10 @@ class FrameTap:
 
     def end(self) -> None:
         struct.pack_into("<I", self.mm, 0, 0)
-        _k32.SetEvent(self.event)
+        self.event.set()
 
     def close(self) -> None:
-        _k32.CloseHandle(self.event)
+        self.event.close()
         self.mm.close()
 
 
@@ -284,9 +267,7 @@ class AudioTap:
     instant replay. A chiaki-ng from before this ring never writes it (its `features` lack FEATURE_AUDIO_TAP)."""
 
     def __init__(self, name: str = NAME + AUDIO_SUFFIX) -> None:
-        if sys.platform != "win32":
-            raise RuntimeError("the chiaki frame tap is Windows-only")
-        self.mm = mmap.mmap(-1, AUDIO_TOTAL, tagname=name)
+        self.mm = open_map(name, AUDIO_TOTAL)
         self.next: int | None = None  # the next chunk to read; None: from wherever the writer is now
 
     def live(self) -> bool:
@@ -325,11 +306,9 @@ class AudioTap:
 
     # Writer side, for tests and the fake PS5 (scripts/frametap_fake.py); chiaki-ng uses frametap.c.
     def begin(self, rate: int = 48000, channels: int = 2) -> None:
-        freq = ctypes.c_int64()
-        _k32.QueryPerformanceFrequency(ctypes.byref(freq))
         struct.pack_into("<I", self.mm, 0, 0)
         struct.pack_into("<5I", self.mm, 4, 1, AUDIO_SLOTS, AUDIO_SLOT_SIZE, rate, channels)
-        struct.pack_into("<QQ", self.mm, 24, 0, freq.value)
+        struct.pack_into("<QQ", self.mm, 24, 0, qpc_freq())
         struct.pack_into("<I", self.mm, 0, AUDIO_MAGIC)
 
     def push(self, pcm: bytes, t_qpc: int | None = None) -> None:

@@ -5,11 +5,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32) || defined(__linux__)
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include "frametap_posix.h" // the Win32 calls below, on Linux
+#endif
 
 #define TOTAL_SIZE ((size_t)FRAMETAP_HEADER_SIZE + (size_t)FRAMETAP_SLOT_COUNT * FRAMETAP_SLOT_SIZE)
 #define AUDIO_TOTAL_SIZE ((size_t)FRAMETAP_AUDIO_HEADER + (size_t)FRAMETAP_AUDIO_SLOT_COUNT * FRAMETAP_AUDIO_SLOT_SIZE)
@@ -250,7 +254,7 @@ void frametap_end(void)
 		SetEvent(g_event);
 }
 
-#else // not Windows: compiled in, does nothing
+#else // not Windows or Linux: compiled in, does nothing
 
 bool frametap_enabled(void) { return false; }
 bool frametap_begin(uint32_t codec, uint32_t width, uint32_t height, uint32_t max_fps)
