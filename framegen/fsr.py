@@ -136,6 +136,23 @@ class FsrScaler:
         GL.glUseProgram(0)
         GL.glBindVertexArray(0)
 
+    def sharpen(self, src_tex: int, dst_fbo: int, x0: int, y0: int, dw: int, dh: int,
+                sharpness: float | None = None) -> None:
+        """Run only the RCAS sharpening pass on an already-upscaled texture (row 0 = image top) into dst_fbo at
+        (x0, y0, dw, dh), upright on screen."""
+        GL = self.GL
+        GL.glBindVertexArray(self.vao)
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, dst_fbo)
+        GL.glViewport(x0, y0, dw, dh)
+        GL.glUseProgram(self.rcas)
+        GL.glUniform2i(self.u_origin, x0, y0)
+        GL.glUniform1f(self.u_sharp, self.sharpness if sharpness is None else float(sharpness))
+        GL.glBindTexture(GL.GL_TEXTURE_2D, src_tex)
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
+        GL.glUseProgram(0)
+        GL.glBindVertexArray(0)
+
     def close(self) -> None:
         GL = self.GL
         if self.mid_tex is not None:

@@ -130,6 +130,7 @@ class RtxVsr:
     The CUDA stream current at creation is the one VSR runs on.
     """
     out_format = "rgba8"  # what it writes into the output array
+    in_format = "rgba8"
     private = False  # its timings may go in the log
     how = "through the RTX Video SDK"
 
@@ -273,6 +274,17 @@ def pack_rgba10(rgba: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     return torch.bitwise_or(v[..., 0] | (v[..., 1] << 10), (v[..., 2] << 20) | _OPAQUE, out=out)
 
 
+def pack_bgr10(bgr: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """HxWx3 BGR (uint8, or float16 0..1) -> `out`, HxW int32 of NVIDIA's packed RGB10A2: R in bits 0-9, G 10-19,
+    B 20-29, alpha 30-31 (opaque). uint8 values are widened exactly (v10 = v8 * 1023 / 255); floats rounded."""
+    if bgr.is_floating_point():
+        v = bgr.float().clamp_(0.0, 1.0).mul_(1023.0).round_().to(torch.int32)
+    else:
+        v = bgr.to(torch.int32)
+        v = (v << 2) | (v >> 6)
+    return torch.bitwise_or(v[..., 2] | (v[..., 1] << 10), (v[..., 0] << 20) | _OPAQUE, out=out)
+
+
 class VfxVsr:
     """Upscales src_w x src_h RGBA frames with RTX VSR through NVIDIA's own package (nvidia-vfx's VideoSuperRes), into
     a caller-provided CUDA array of 32-bit words (an R32UI texture) as NVIDIA's packed 10-bit RGB.
@@ -281,6 +293,7 @@ class VfxVsr:
     stream current at creation is the one it runs on.
     """
     out_format = "rgb10a2"
+    in_format = "rgb10a2"
     private = True  # NVIDIA's licence: no benchmark results published, so its timings stay out of the log
     how = "through NVIDIA's package (Experimental)"
 
@@ -302,8 +315,24 @@ class VfxVsr:
         self.size = (src_w * 2, src_h * 2)  # the output size, set again for each window size (no reload needed)
         self.fx.output_width, self.fx.output_height = self.size
         self.fx.load()
-        self.inp = torch.empty((src_h, src_w), dtype=torch.int32, device="cuda")
+        self.inp = torch.zeros((src_h, src_w), dtype=torch.int32, device="cuda")
+        self._warmed_size: tuple[int, int] | None = None
         self.gpu_ms: list[float] = []  # (never filled: private)
+        self.warm_up()
+
+    def warm_up(self, out_w: int | None = None, out_h: int | None = None) -> None:
+        """Run one dummy VSR pass at startup so TensorRT/VFX kernels are ready before tick 1."""
+        target = (out_w, out_h) if (out_w is not None and out_h is not None) else self.size
+        if self._warmed_size == target:
+            return
+        if target != self.size:
+            self.size = target
+            self.fx.output_width, self.fx.output_height = target
+        with torch.cuda.stream(self.stream):
+            self.inp.zero_()
+            self.fx.run(self.inp.view(torch.uint32), non_blocking=True, stream_ptr=self.stream.cuda_stream)
+        self.stream.synchronize()
+        self._warmed_size = target
 
     @staticmethod
     def level(quality: int, clean: bool) -> int:
@@ -324,18 +353,28 @@ class VfxVsr:
     def forget(self, array: ctypes.c_void_p) -> None:
         """(Nothing is cached per output array.)"""
 
-    def __call__(self, rgba: torch.Tensor, out_array: ctypes.c_void_p, out_w: int, out_h: int,
+    def __call__(self, frame: torch.Tensor, out_array: ctypes.c_void_p, out_w: int, out_h: int,
                  quality: int | None = None) -> None:
-        """Upscale rgba (h x w x 4, contiguous CUDA) into out_array's top-left out_w x out_h, as packed RGB10A2."""
+        """Upscale frame (HxWx4 RGBA, HxWx3 BGR, or HxW packed RGB10A2 int32/uint32, CUDA) into out_array's
+        top-left out_w x out_h, as packed RGB10A2."""
         if quality is not None and int(quality) != self._quality:
             self.quality = quality
         if (out_w, out_h) != self.size:
             self.size = (out_w, out_h)
             self.fx.output_width, self.fx.output_height = out_w, out_h
         stream = self.stream.cuda_stream
-        with torch.cuda.stream(self.stream):
-            pack_rgba10(rgba, self.inp)
-        out = self.fx.run(self.inp.view(torch.uint32), non_blocking=True, stream_ptr=stream)
+        if frame.ndim == 2 and frame.dtype in (torch.int32, torch.uint32):
+            with torch.cuda.stream(self.stream):
+                inp = frame if frame.is_contiguous() else frame.contiguous()
+            src = inp.view(torch.uint32)
+        else:
+            with torch.cuda.stream(self.stream):
+                if frame.shape[-1] == 3:
+                    pack_bgr10(frame, self.inp)
+                else:
+                    pack_rgba10(frame, self.inp)
+            src = self.inp.view(torch.uint32)
+        out = self.fx.run(src, non_blocking=True, stream_ptr=stream)
         img = torch.from_dlpack(out.image)  # (out_h, out_w) words in NVIDIA's memory until the next run: copied now
         if tuple(img.shape) != (out_h, out_w):
             raise RuntimeError(f"RTX VSR: {tuple(img.shape)} out, {(out_h, out_w)} expected")

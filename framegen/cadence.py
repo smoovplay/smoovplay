@@ -121,6 +121,12 @@ class DuplicateDetector:
         self.rhythm: tuple[int, int] | None = None  # (period, where the next new frame falls in it), once steady
         self.held = 0
 
+    def reset(self) -> None:
+        self._prev = None
+        self._means.clear()
+        self._calls.clear()
+        self.rhythm = None
+
     def _learned(self, mean: float) -> tuple[bool, float] | None:
         """The two-band rule's call on a frame's mean difference and how sure it is (0 on the line, 1 at a band's
         middle), or None when the recent frames don't show two bands."""

@@ -50,6 +50,8 @@ if sys.platform == "win32":
 else:  # importable elsewhere (its structures and the presentation choice are tested on macOS); never called there
     from ctypes import CFUNCTYPE as WINFUNCTYPE
 
+from .display_sync import DisplayTimes
+
 # ---------------------------------------------------------------------------------------------- Windows constants
 DXGI_FORMAT_UNKNOWN = 0
 DXGI_FORMAT_B8G8R8A8_UNORM = 87
@@ -64,6 +66,9 @@ DXGI_SCALING_STRETCH = 0
 DXGI_SWAP_EFFECT_FLIP_DISCARD = 4
 DXGI_ALPHA_MODE_IGNORE = 3
 DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING = 2048
+DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT = 0x40
+WAIT_OBJECT_0 = 0
+WAIT_MS = 100  # longest wait for the swap chain to take a frame: never blocks forever (watchdog, minimised window)
 DXGI_PRESENT_ALLOW_TEARING = 0x200
 DXGI_FEATURE_PRESENT_ALLOW_TEARING = 0
 DXGI_MWA_NO_ALT_ENTER = 2
@@ -91,6 +96,7 @@ IID_IDXGIFactory2 = "50c83a1c-e072-4c48-87b0-3630fa36a6d0"
 IID_IDXGIFactory5 = "7632e1f5-ee65-4dca-87fd-84cd75f8838d"
 IID_IDXGIDevice1 = "77db970f-6276-48ba-ba28-070143b4392c"
 IID_ID3D11Texture2D = "6f15aaf2-d208-4e89-9ab4-489535d34f9c"
+IID_IDXGISwapChain2 = "a8be2ac4-199f-4946-b331-79599fb98de7"
 IID_IDXGISwapChain3 = "94d99bdb-f1f8-4ab0-b236-7da0170edab1"
 IID_IDXGISwapChain4 = "3d585d5a-bd4a-489e-b1f4-3dbcb6452ffb"
 IID_IDXGIOutput6 = "068346e8-aaec-4b84-add7-137f513f77a1"
@@ -107,6 +113,8 @@ FACTORY5_CHECK_FEATURE_SUPPORT = 28
 ADAPTER1_GET_DESC1 = 10
 DEVICE1_SET_MAXIMUM_FRAME_LATENCY = 12
 SWAP_CHAIN_PRESENT, SWAP_CHAIN_GET_BUFFER, SWAP_CHAIN_RESIZE_BUFFERS = 8, 9, 13
+SWAP_CHAIN_GET_FRAME_STATISTICS, SWAP_CHAIN_GET_LAST_PRESENT_COUNT = 16, 17
+SWAP_CHAIN2_SET_MAXIMUM_FRAME_LATENCY, SWAP_CHAIN2_GET_FRAME_LATENCY_WAITABLE_OBJECT = 31, 33
 DEVICE_CREATE_TEXTURE2D = 5
 CONTEXT_MAP, CONTEXT_UNMAP, CONTEXT_COPY_RESOURCE = 14, 15, 47
 
@@ -123,6 +131,11 @@ class SwapChainDesc1(ctypes.Structure):  # DXGI_SWAP_CHAIN_DESC1
     _fields_ = [("Width", c_uint), ("Height", c_uint), ("Format", c_uint), ("Stereo", c_int),
                 ("SampleCount", c_uint), ("SampleQuality", c_uint), ("BufferUsage", c_uint), ("BufferCount", c_uint),
                 ("Scaling", c_uint), ("SwapEffect", c_uint), ("AlphaMode", c_uint), ("Flags", c_uint)]
+
+
+class FrameStatistics(ctypes.Structure):  # DXGI_FRAME_STATISTICS
+    _fields_ = [("PresentCount", c_uint), ("PresentRefreshCount", c_uint), ("SyncRefreshCount", c_uint),
+                ("SyncQPCTime", ctypes.c_int64), ("SyncGPUTime", ctypes.c_int64)]
 
 
 class Texture2DDesc(ctypes.Structure):  # D3D11_TEXTURE2D_DESC
@@ -296,6 +309,41 @@ def display_hdr(hwnd=None) -> dict | None:
     return None
 
 
+def _qpc() -> tuple[int, int]:
+    k32 = ctypes.WinDLL("kernel32")
+    c, f = ctypes.c_int64(), ctypes.c_int64()
+    k32.QueryPerformanceCounter(byref(c))
+    k32.QueryPerformanceFrequency(byref(f))
+    return c.value, f.value or 1
+
+
+try:
+    _QPF = _qpc()[1]
+except (OSError, AttributeError):  # (not Windows: the module still imports, for its tests)
+    _QPF = 1
+
+
+def _qpc_offset() -> float:
+    """time.perf_counter() minus QueryPerformanceCounter, in seconds: frame statistics' times are QPC ticks."""
+    try:
+        c, f = _qpc()
+        return time.perf_counter() - c / f
+    except (OSError, AttributeError):
+        return 0.0
+
+
+def _wait_for(handle, timeout_ms: int) -> bool:
+    k32 = ctypes.WinDLL("kernel32")
+    k32.WaitForSingleObjectEx.argtypes, k32.WaitForSingleObjectEx.restype = [c_void_p, c_uint, c_int], c_uint
+    return k32.WaitForSingleObjectEx(c_void_p(handle), int(timeout_ms), 1) == WAIT_OBJECT_0
+
+
+def _close_handle(handle) -> None:
+    k32 = ctypes.WinDLL("kernel32")
+    k32.CloseHandle.argtypes = [c_void_p]
+    k32.CloseHandle(c_void_p(handle))
+
+
 class DxgiPresenter:
     """A flip-model swap chain on `hwnd`, fed by OpenGL. Draw into `fbo` (sized with resize()), then present().
 
@@ -314,6 +362,10 @@ class DxgiPresenter:
         self.back = self.shared = self.obj = self.hdev = None
         self.tex = self.fbo = self.rb = self.back_fbo = None
         self.presents, self.snaps, self.snap_next = 0, 0, False
+        self.waitable = None  # the swap chain's frame latency waitable object (a HANDLE), when DXGI 1.3 gives one
+        self.times = DisplayTimes()  # when frames actually reached the screen (GetFrameStatistics)
+        self.refresh_hz = 60.0  # the display's, for times between statistics samples (the window sets it)
+        self._qpc_offset = _qpc_offset()
         self.mode = MODE if MODE in ("direct", "copy") else "copy"
         try:
             self._open(w, h)
@@ -347,23 +399,31 @@ class DxgiPresenter:
                     DXGI_FEATURE_PRESENT_ALLOW_TEARING, byref(allow), ctypes.sizeof(allow)) >= 0:
                 self.tearing = bool(allow.value)
             _release(factory5)
-        self.flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING if self.tearing else 0
-        desc = SwapChainDesc1(Width=max(w, 1), Height=max(h, 1), Format=self.format, SampleCount=1,
-                              BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT, BufferCount=BUFFERS,
-                              Scaling=DXGI_SCALING_STRETCH,
-                              SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD, AlphaMode=DXGI_ALPHA_MODE_IGNORE,
-                              Flags=self.flags)
-        self.swap_chain = c_void_p()
-        _check(_com(self.factory2, FACTORY2_CREATE_SWAP_CHAIN_FOR_HWND,
-                    [c_void_p, c_void_p, POINTER(SwapChainDesc1), c_void_p, c_void_p, POINTER(c_void_p)],
-                    self.device, c_void_p(hwnd_value(self.hwnd)), byref(desc), None, None, byref(self.swap_chain)),
-               "CreateSwapChainForHwnd")
+        # A frame latency waitable object (DXGI 1.3): wait() returns when the swap chain can take the next frame, so
+        # with a sync interval each Present lines up with a refresh and the display, not a timer, spaces the frames.
+        tearing = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING if self.tearing else 0
+        hr = 0
+        for self.flags in (tearing | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, tearing):
+            desc = SwapChainDesc1(Width=max(w, 1), Height=max(h, 1), Format=self.format, SampleCount=1,
+                                  BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT, BufferCount=BUFFERS,
+                                  Scaling=DXGI_SCALING_STRETCH,
+                                  SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD, AlphaMode=DXGI_ALPHA_MODE_IGNORE,
+                                  Flags=self.flags)
+            self.swap_chain = c_void_p()
+            hr = _com(self.factory2, FACTORY2_CREATE_SWAP_CHAIN_FOR_HWND,
+                      [c_void_p, c_void_p, POINTER(SwapChainDesc1), c_void_p, c_void_p, POINTER(c_void_p)],
+                      self.device, c_void_p(hwnd_value(self.hwnd)), byref(desc), None, None, byref(self.swap_chain))
+            if hr >= 0:
+                break
+        _check(hr, "CreateSwapChainForHwnd")
+        if self.flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT:
+            self._open_waitable()
         _com(self.factory2, FACTORY_MAKE_WINDOW_ASSOCIATION, [c_void_p, c_uint], c_void_p(hwnd_value(self.hwnd)),
              DXGI_MWA_NO_ALT_ENTER)  # Alt+Enter is ours (F), not DXGI's exclusive fullscreen
         if self.hdr:
             self._set_hdr_color_space()
         device1 = _query(self.device, IID_IDXGIDevice1)
-        if device1 is not None:  # at most one frame queued ahead: no extra delay when the GPU is ahead
+        if device1 is not None and not self.waitable:  # at most one frame queued ahead (else the waitable chain's)
             _com(device1, DEVICE1_SET_MAXIMUM_FRAME_LATENCY, [c_uint], 1)
             _release(device1)
         self.hdev = self.wgl.open_device(self.device)
@@ -372,7 +432,41 @@ class DxgiPresenter:
         self.tex, self.fbo = GL.glGenTextures(1), GL.glGenFramebuffers(1)
         self.rb, self.back_fbo = GL.glGenRenderbuffers(1), GL.glGenFramebuffers(1)
         self.resize(max(w, 1), max(h, 1))
-        self.present(True, check=True)  # fails here, not mid-session, if the driver can't do it
+        self.wait()  # consume the waitable object's initial signal so this check Present doesn't leave its count at 2
+        self.present(1, check=True)  # fails here, not mid-session, if the driver can't do it
+
+    def _open_waitable(self) -> None:
+        """At most one frame queued ahead, and the object that says when the next one can go (else self.waitable
+        stays None and Present itself blocks, as before)."""
+        sc2 = _query(self.swap_chain, IID_IDXGISwapChain2)
+        if sc2 is None:
+            return
+        try:
+            _com(sc2, SWAP_CHAIN2_SET_MAXIMUM_FRAME_LATENCY, [c_uint], 1)
+            self.waitable = _com(sc2, SWAP_CHAIN2_GET_FRAME_LATENCY_WAITABLE_OBJECT, [], restype=c_void_p) or None
+        finally:
+            _release(sc2)
+
+    def wait(self, timeout_ms: int = WAIT_MS) -> bool:
+        """Waits until the swap chain can take the next frame (the one before is on screen or about to be): with a
+        sync interval, the display's refresh paces the caller. Never longer than timeout_ms. True if it was ready.
+        (ctypes lets go of the GIL meanwhile, so the source's reader thread keeps running.)"""
+        if not self.waitable:
+            return True
+        return _wait_for(self.waitable, timeout_ms)
+
+    def _measure(self, t_sent: float) -> None:
+        """Notes this Present's number and time, and when the latest frame to reach the screen got there (frame
+        statistics; skipped quietly when Windows has none, e.g. the window is hidden or the display changed mode)."""
+        count = c_uint(0)
+        if _com(self.swap_chain, SWAP_CHAIN_GET_LAST_PRESENT_COUNT, [POINTER(c_uint)], byref(count)) >= 0:
+            self.times.sent(count.value, t_sent)
+        fs = FrameStatistics()
+        if _com(self.swap_chain, SWAP_CHAIN_GET_FRAME_STATISTICS, [POINTER(FrameStatistics)], byref(fs)) < 0:
+            return
+        if fs.SyncQPCTime > 0 and fs.PresentCount:
+            self.times.observe(fs.PresentCount, fs.PresentRefreshCount, fs.SyncRefreshCount,
+                               fs.SyncQPCTime / _QPF + self._qpc_offset, 1.0 / max(self.refresh_hz, 1.0))
 
     def _set_hdr_color_space(self) -> None:
         """HDR10's colour space (PQ, BT.2020) and its metadata on the swap chain. Raises OSError if the display can't
@@ -455,9 +549,11 @@ class DxgiPresenter:
         self.snap_next = self.w > 0  # (testing) the first frame at the new size, after it's drawn
         self.w, self.h = w, h
 
-    def present(self, vsync: bool, check: bool = False, tear: bool = True) -> None:
-        """Copies `fbo` into the back buffer (upright) and shows it. vsync off: at once, tearing if allowed (and tear:
-        the caller may turn it off, e.g. in a window that never tore before)."""
+    def present(self, interval: int, check: bool = False, tear: bool = True) -> None:
+        """Copies `fbo` into the back buffer (upright) and shows it. interval: the sync interval, the refreshes this
+        frame waits for (and stays up for) after the one before (framegen/display_sync.py); 0: at once, tearing if
+        allowed (and tear: the caller may turn it off, e.g. in a window that never tore before). Call wait() first."""
+        interval = max(0, min(4, int(interval)))
         GL, handles = self.GL, (c_void_p * 1)(self.obj)
         t0 = time.perf_counter()
         if not self.wgl.lock(self.hdev, 1, handles):
@@ -477,12 +573,15 @@ class DxgiPresenter:
             _com(self.context, CONTEXT_COPY_RESOURCE, [c_void_p, c_void_p], self.back, self.shared, restype=None)
         self.presents += 1
         if SNAP_DIR and not check and self.snaps < SNAP_MAX and (self.snap_next or self.presents % SNAP_EVERY == 0):
-            self._snap(vsync)
-        sync, flags = (1, 0) if vsync else (0, DXGI_PRESENT_ALLOW_TEARING if self.tearing and tear else 0)
+            self._snap(interval)
+        # (ALLOW_TEARING with a sync interval is an invalid call)
+        flags = DXGI_PRESENT_ALLOW_TEARING if interval == 0 and self.tearing and tear else 0
         t0 = time.perf_counter()
-        hr = _com(self.swap_chain, SWAP_CHAIN_PRESENT, [c_uint, c_uint], sync, flags)
+        hr = _com(self.swap_chain, SWAP_CHAIN_PRESENT, [c_uint, c_uint], interval, flags)
         self._say_if_slow("Present call", t0)
         _check(hr, "Present")
+        if not check:
+            self._measure(t0)
 
     def _say_if_slow(self, what: str, t0: float) -> None:
         ms = (time.perf_counter() - t0) * 1000
@@ -514,12 +613,12 @@ class DxgiPresenter:
         finally:
             _release(staging)
 
-    def _snap(self, vsync: bool) -> None:
+    def _snap(self, interval: int) -> None:
         from .imagefile import write_image
         self.snap_next = False
         try:
             os.makedirs(SNAP_DIR, exist_ok=True)
-            name = f"dxgi_{self.presents:06d}_{self.w}x{self.h}_vsync-{'on' if vsync else 'off'}.png"
+            name = f"dxgi_{self.presents:06d}_{self.w}x{self.h}_sync-{interval}.png"
             img = self.read_back()
             write_image(os.path.join(SNAP_DIR, name), img << 6 if self.hdr else img)  # (HDR: a 16-bit PNG of PQ)
             self.snaps += 1
@@ -529,6 +628,9 @@ class DxgiPresenter:
 
     def close(self) -> None:
         GL = self.GL
+        if self.waitable:
+            _close_handle(self.waitable)
+            self.waitable = None
         try:
             self._detach()
             if self.hdev:

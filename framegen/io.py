@@ -16,6 +16,7 @@ from typing import NamedTuple
 import cv2
 import numpy as np
 
+from . import display_sync
 from .fill import Panorama, layout, panorama_t, visible, wider
 from .glblit import Blitter
 
@@ -39,6 +40,7 @@ class Tick:
     t_source: float | None = None  # the source's own time for the frame, in seconds (a file's position; later, a
     # capture card's timestamp), for timing frames by the source's clock rather than by arrival
     extra: dict = field(default_factory=dict)  # anything else, for logs (e.g. Remote Play's per-frame facts)
+    ready_event: object = None  # torch.cuda.Event recorded on the producer's CUDA stream; consumer calls wait_event()
 
 
 class Waiting(NamedTuple):
@@ -54,7 +56,71 @@ class Waiting(NamedTuple):
 WAIT_POLL_S = 0.1  # how long a source waits for a frame before saying so
 
 
-def queue_ticks(q: queue.Queue, what: str, why=None):
+class LatestFrameMailbox:
+    """Thread-safe 1-slot latest-frame mailbox.
+
+    A producer overwrites any unconsumed slot with the newest frame and increments `dropped`,
+    so a consumer always receives the latest decoded frame without standing FIFO queue latency.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._slot = None
+        self._has_item = False
+        self._closed = False
+        self.dropped = 0
+
+    def put(self, item) -> bool:
+        """Store `item` as the latest frame. Returns True if an unconsumed frame was overwritten."""
+        if item is None:
+            self.close()
+            return False
+        with self._cond:
+            if self._closed:
+                return False
+            overwrote = self._has_item
+            if overwrote:
+                self.dropped += 1
+            self._slot = item
+            self._has_item = True
+            self._cond.notify()
+            return overwrote
+
+    def get(self, timeout: float | None = None):
+        """Pop and return the latest frame, None if closed and empty, or raise queue.Empty on timeout."""
+        with self._cond:
+            if not self._has_item and not self._closed:
+                if timeout is None:
+                    while not self._has_item and not self._closed:
+                        self._cond.wait()
+                else:
+                    deadline = time.monotonic() + max(0.0, timeout)
+                    while not self._has_item and not self._closed:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0.0:
+                            raise queue.Empty
+                        self._cond.wait(remaining)
+            if self._has_item:
+                item = self._slot
+                self._slot = None
+                self._has_item = False
+                return item
+            return None
+
+    def clear(self) -> None:
+        """Discard any unconsumed frame without counting it as dropped."""
+        with self._cond:
+            self._slot = None
+            self._has_item = False
+
+    def close(self) -> None:
+        """Mark the mailbox closed and wake any waiting consumer."""
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+
+def queue_ticks(q: queue.Queue | LatestFrameMailbox, what: str, why=None):
     """A live source's ticks, as its reader thread puts them in `q` (None ends them), numbered from 0, with a
     Waiting in between whenever none has come for WAIT_POLL_S. why: () -> the source's hint for the Waiting."""
     i, last = 0, time.perf_counter()
@@ -285,8 +351,19 @@ def _is_cuda(frame) -> bool:
     return getattr(frame, "is_cuda", False)
 
 
+def _is_rgb10a2(frame) -> bool:
+    if not _is_cuda(frame):
+        return False
+    import torch
+    return frame.ndim == 2 and frame.dtype in (torch.int32, torch.uint32)
+
+
 def _host(frame) -> np.ndarray:
     """A frame as a numpy array (CUDA tensors are copied to the CPU)."""
+    if _is_rgb10a2(frame):
+        import torch
+        from .vfg import unpack_rgb10a2
+        return unpack_rgb10a2(frame.view(torch.int32)).cpu().numpy()
     return frame.cpu().numpy() if _is_cuda(frame) else frame
 
 
@@ -538,14 +615,15 @@ class GLWindowSink:
         self._choose_presentation(w, h, hdr, hdr_peak)
         if self.dx is None:
             if overlay_of is not None:  # borderless, on top, click-through, and not focused when it opens
-                for hint, value in ((glfw.DECORATED, glfw.FALSE), (glfw.FLOATING, glfw.TRUE),
-                                    (glfw.FOCUSED, glfw.FALSE), (glfw.FOCUS_ON_SHOW, glfw.FALSE),
-                                    (glfw.MOUSE_PASSTHROUGH, glfw.TRUE)):
-                    glfw.window_hint(hint, value)
+                self._apply_overlay_hints(glfw)
             self.win = self.glwin = glfw.create_window(min(w, 1600), min(h, 900), "SmoovPlay", None, None)
             glfw.default_window_hints()
             glfw.make_context_current(self.win)
-        glfw.swap_interval(1 if st.vsync else 0)
+        # How frames meet the display's refreshes (framegen/display_sync.py), followed live by _update_sync().
+        self.sync = display_sync.plan(60.0, 60, True, False)
+        self._sync_key, self._refresh_hz, self._refresh_next, self._sync_noted = None, 60.0, 0.0, set()
+        self._note_pending = ""  # shown once the toast before it (the keys, at first) has gone
+        self._update_sync(force=True)
         # Fullscreen stays up when another window takes the focus (a click on a second display, a notification), as
         # borderless fullscreen does in games. GLFW's default minimises it, which with DXGI could also stall Present.
         glfw.set_window_attrib(self.win, glfw.AUTO_ICONIFY, glfw.FALSE)
@@ -598,6 +676,8 @@ class GLWindowSink:
 
         from .fsr import FsrScaler, GpuTimer
         self.fsr = self.vsr = self.vsr_out = None
+        self._last_was_vsr = False
+        self._upscaling = False
         try:
             self.fsr = FsrScaler(GL, sharpness, hdr=self.hdr10)
         except Exception as e:  # noqa: BLE001 - shader trouble just means another scaler
@@ -660,6 +740,10 @@ class GLWindowSink:
             if st.fullscreen:
                 self._set_fullscreen(True)
             self.take_focus()
+        if self.mode == "vsr" and self.vsr is not None and hasattr(self.vsr, "warm_up"):
+            _, _, _, dw, dh, _, _ = self._layout()
+            if dw > self.w or dh > self.h:
+                self.vsr.warm_up(dw, dh)
 
     def take_focus(self) -> None:
         """The keys (M, R, K...) go to this window from the start, without a click on it first: the program in front
@@ -761,9 +845,14 @@ class GLWindowSink:
             self._hint_next = now + 20.0
             self.toast(self.KEYS_HINT, 3.0 if self.hotkeys is None else 6.0)
 
+    def _vsr_rcas(self) -> float | None:
+        s = getattr(self.settings, "vsr_sharpness", "off")
+        return float(s) if self.fsr is not None and s != "off" else None
+
     def _name(self, mode: str) -> str:
         if mode == "vsr":
-            return f"RTX VSR q{self.vsr.quality if self.vsr is not None else self.settings.vsr_quality}"
+            q = self.vsr.quality if self.vsr is not None else self.settings.vsr_quality
+            return f"RTX VSR q{q}" + (" + RCAS" if self._vsr_rcas() is not None else "")
         return self.NAMES[mode]
 
     def _vsr_ready(self) -> bool:
@@ -826,13 +915,19 @@ class GLWindowSink:
                 return  # (it said why; Low delay would fail the same way)
         if st.present != "dxgi":
             return  # the standard presentation
-        if self.overlay_of is not None:
-            print("[display] window capture: standard presentation (the overlay draws with OpenGL)")
-        elif not st.fullscreen or FULLSCREEN_STYLE != "none":
+        if self.overlay_of is not None or not st.fullscreen or FULLSCREEN_STYLE != "none":
             self._open_dxgi(w, h)
         else:
             print("[display] fullscreen: standard presentation (Low delay is for windowed play; fullscreen already "
                   "skips the compositor)")
+
+    @staticmethod
+    def _apply_overlay_hints(glfw) -> None:
+        """Window hints for click-through, non-activating overlays."""
+        for hint, value in ((glfw.DECORATED, glfw.FALSE), (glfw.FLOATING, glfw.TRUE),
+                            (glfw.FOCUSED, glfw.FALSE), (glfw.FOCUS_ON_SHOW, glfw.FALSE),
+                            (glfw.MOUSE_PASSTHROUGH, glfw.TRUE)):
+            glfw.window_hint(hint, value)
 
     def note_presentation(self) -> None:
         """The "present" row can't be changed while Windows' HDR keeps the window on DXGI (it overrides HDR output's
@@ -856,6 +951,8 @@ class GLWindowSink:
             if not glwin:
                 raise RuntimeError("couldn't open an OpenGL context")
             glfw.window_hint(glfw.CLIENT_API, glfw.NO_API)
+            if self.overlay_of is not None:
+                self._apply_overlay_hints(glfw)
             win = glfw.create_window(min(w, 1600), min(h, 900), "SmoovPlay", None, None)
             glfw.default_window_hints()
             if not win:
@@ -898,12 +995,68 @@ class GLWindowSink:
         on DXGI only because Windows' HDR is on (KEEP_HDR): with the standard presentation it never tore."""
         return not self.keep_hdr or self._borderless or self.settings.present == "dxgi"
 
+    last_wait_s = 0.0  # the last frame's wait for the display (DXGI's waitable object): pacing, not work
+
+    @property
+    def paced_by_display(self) -> bool:
+        """The display's refreshes space the frames (the pipeline's pacer then doesn't sleep to a timer): VSync on, a
+        refresh rate that fits the output rate, and DXGI's frame latency waitable object to wait on."""
+        return self.dx is not None and bool(self.dx.waitable) and self.sync.display_paces
+
+    def _update_sync(self, force: bool = False) -> None:
+        """Follows the display's refresh rate (read every 2 s: the window can move to another monitor) and the
+        settings, and re-plans how frames meet the refreshes when either changed."""
+        now = time.perf_counter()
+        if force or now >= self._refresh_next:
+            self._refresh_next = now + 2.0
+            self._refresh_hz = self._read_refresh() or self._refresh_hz
+        st = self.settings
+        key = (self._refresh_hz, int(getattr(st, "hz", 60)), bool(st.vsync), bool(getattr(st, "vrr", False)))
+        if key == self._sync_key and not force:
+            return
+        changed = key != self._sync_key
+        self._sync_key = key
+        self.sync = display_sync.plan(*key)
+        if self.dx is not None:
+            self.dx.refresh_hz = self._refresh_hz
+        else:
+            self.glfw.swap_interval(self.sync.interval)
+        if changed:
+            how = self.sync.describe(key[0], key[1])
+            if self.sync.mode == "locked" and self.dx is not None and not self.dx.waitable:
+                how += " (no waitable swap chain: Present waits instead)"
+            elif self.sync.mode == "vrr" and self.dx is None and not st.fullscreen:
+                how += " (in a window this needs Window presentation: Low delay)"
+            print(f"[display] {how}")
+            if self.sync.note and self.sync.note not in self._sync_noted:
+                self._sync_noted.add(self.sync.note)
+                print(f"[display] {self.sync.note}")
+                self._note_pending = self.sync.note
+
+    def _read_refresh(self) -> float:
+        """The refresh rate of the monitor the window is (mostly) on, in Hz; 0 if Windows won't say."""
+        try:
+            from .dxgi_present import hwnd_value
+            from .window import monitor_of
+            return float(monitor_of(hwnd_value(self.glfw.get_win32_window(self.win)))[2])
+        except Exception:  # noqa: BLE001 - not Windows, or no window yet: keep the last
+            return 0.0
+
     def _present(self) -> None:
+        self.last_wait_s = 0.0
+        self._update_sync()
+        if self._note_pending and time.perf_counter() >= self._toast_until:
+            self.toast(self._note_pending, 8.0)
+            self._note_pending = ""
         if self.dx is not None:
             if self.glfw.get_window_attrib(self.win, self.glfw.ICONIFIED):
                 return  # minimised: nothing to show, and a flip-model Present can wait for a window nobody sees
             t0 = time.perf_counter()
-            self.dx.present(self.settings.vsync, tear=self._may_tear())
+            self.dx.wait()  # (never more than 100 ms) the display's refresh paces this when the sync interval is set
+            self.last_wait_s = time.perf_counter() - t0
+            _say_if_slow("DXGI frame wait", t0)
+            t0 = time.perf_counter()
+            self.dx.present(self.sync.interval, tear=self.sync.tear and self._may_tear())
             _say_if_slow("DXGI Present", t0)
         else:
             self.glfw.swap_buffers(self.win)
@@ -943,7 +1096,7 @@ class GLWindowSink:
                            + ("" if st.fill == "fit" else "\nThe same 16:9 picture: consoles send 16:9 only"), 3.0)
             return
         elif key == "fullscreen":
-            if self.dx is not None and st.fullscreen and self.fs_style == "none":
+            if self.dx is not None and st.fullscreen and self.fs_style == "none" and self.overlay_of is None:
                 self.toast("Fullscreen starts next time you press Play: Low delay works in a window only", 5.0)
                 return
             self._set_fullscreen(st.fullscreen)
@@ -952,8 +1105,8 @@ class GLWindowSink:
                 self.toast("Windows' HDR is on now: fullscreen switches the display to SDR until you press Play again",
                            6.0)
                 return
-        elif key == "vsync":
-            glfw.swap_interval(1 if st.vsync else 0)
+        elif key in ("vsync", "vrr"):
+            self._update_sync(force=True)
         elif key in ("look", "look_on"):
             if not self.menu.open:
                 self.toast(f"Look: {self.looks.name() if st.look_on else 'Off'}")
@@ -1067,7 +1220,8 @@ class GLWindowSink:
             mode = glfw.get_video_mode(mon)
             glfw.set_window_monitor(win, mon, 0, 0, mode.size.width, mode.size.height, mode.refresh_rate)
         _say_if_slow("fullscreen " + ("on" if on else "off"), t0)
-        glfw.swap_interval(1 if self.settings.vsync else 0)
+        self._refresh_next = 0.0  # (it may be on another monitor, or another mode)
+        self._update_sync(force=True)
 
     def _monitor_under_window(self):
         """Where fullscreen goes: the monitor the window is mostly on, so F fills the screen it was moved to rather
@@ -1210,6 +1364,16 @@ class GLWindowSink:
                 below = self.mini_panel.h + max(2, int(4 * self._stats_ui(dh)))
             p.blit(x0 + dw - p.w - m, y0 + dh - m - below)
 
+    def _blit_last(self, x0: int, y0: int, dw: int, dh: int) -> None:
+        GL = self.GL
+        if self._last_was_vsr and self.vsr_out is not None:
+            GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.vsr_out[1])
+            sw, sh = self.vsr_out[3], self.vsr_out[4]
+        else:
+            GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.fbo)
+            sw, sh = self.w, self.h
+        GL.glBlitFramebuffer(0, 0, sw, sh, x0, y0 + dh, x0 + dw, y0, GL.GL_COLOR_BUFFER_BIT, GL.GL_LINEAR)
+
     def busy(self, fn, text: str):
         """Run fn() on a worker thread while the window stays responsive, showing the last frame and `text`.
         Returns fn()'s result (or raises its exception). Keys pressed meanwhile (e.g. q) take effect after."""
@@ -1276,22 +1440,43 @@ class GLWindowSink:
             return cmd
         return None
 
+    @property
+    def rgb10a2_vsr(self) -> bool:
+        return (self.mode == "vsr" and self.vsr is not None
+                and getattr(self.vsr, "in_format", None) == "rgb10a2"
+                and self.interop is not None and self._upscaling)
+
     def write(self, frame, text: str | None = None) -> str | None:
-        """frame: HxWx3 uint8 BGR, a numpy array or a CUDA tensor."""
+        """frame: HxWx3 uint8 BGR (numpy or CUDA), or HxW int32/uint32 packed RGB10A2 CUDA tensor."""
         GL, glfw = self.GL, self.glfw
         if self._waited >= 0:  # a picture again after a wait: its note goes
             self._waited, self._toast_until = -1, 0.0
         if self.overlay_of is not None:
             self._follow()
-        on_gpu = _is_cuda(frame) and self.interop is not None
-        if on_gpu:
-            self.interop.upload(frame)
-        else:
-            GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
-            host = np.ascontiguousarray(_host(frame))
-            GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, self.w, self.h, GL.GL_BGR,
-                               GL.GL_HALF_FLOAT if host.dtype == np.float16 else GL.GL_UNSIGNED_BYTE, host)
         fw, fh, s, dw, dh, x0, y0 = self._layout()
+        upscale = dw > self.w or dh > self.h
+        self._upscaling = upscale
+        on_gpu = _is_cuda(frame) and self.interop is not None
+        mode = self.mode
+        if mode == "vsr" and not on_gpu:  # a CPU frame: VSR needs it on the GPU
+            mode = "fsr" if self.fsr is not None else "bilinear"
+        direct_vsr = (upscale and mode == "vsr" and on_gpu and self.vsr is not None
+                      and getattr(self.vsr, "in_format", None) == "rgb10a2")
+        if direct_vsr:
+            self._last_was_vsr = True
+        else:
+            self._last_was_vsr = False
+            if _is_rgb10a2(frame):
+                import torch
+                from .vfg import unpack_rgb10a2
+                frame = unpack_rgb10a2(frame.view(torch.int32), hdr=self.hdr10)
+            if on_gpu:
+                self.interop.upload(frame)
+            else:
+                GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
+                host = np.ascontiguousarray(_host(frame))
+                GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, self.w, self.h, GL.GL_BGR,
+                                   GL.GL_HALF_FLOAT if host.dtype == np.float16 else GL.GL_UNSIGNED_BYTE, host)
         target = screen = self._target()
         GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, target)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
@@ -1302,10 +1487,6 @@ class GLWindowSink:
                 self.panorama = Panorama(GL)
             target, x0, y0 = self.panorama.target(dw, dh), 0, 0
             GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, target)
-        upscale = dw > self.w or dh > self.h
-        mode = self.mode
-        if mode == "vsr" and not on_gpu:  # a CPU frame: VSR needs it on the GPU
-            mode = "fsr" if self.fsr is not None else "bilinear"
         label = self._name(mode) if upscale else "no upscale"
         self._frame_no += 1
         plan = self.look_gl.plan(self.looks.current(), self.looks.rev) if self.look_gl is not None else None
@@ -1316,7 +1497,13 @@ class GLWindowSink:
                 self.fsr.draw(self.tex, self.w, self.h, fbo, 0, 0, dw, dh)
                 flip_in = True  # (FSR draws upright)
             elif upscale and mode == "vsr":
-                src, flip_in = self._vsr_render(dw, dh)[0], False
+                if (sharp := self._vsr_rcas()) is not None:
+                    vsr_tex = self._vsr_render(dw, dh, frame if direct_vsr else None)[0]
+                    src, fbo = self.look_gl.input_target(dw, dh)
+                    self.fsr.sharpen(vsr_tex, fbo, 0, 0, dw, dh, sharp)
+                    flip_in = True
+                else:
+                    src, flip_in = self._vsr_render(dw, dh, frame if direct_vsr else None)[0], False
             else:
                 src, flip_in = self.tex, False  # the look's first pass resizes it
             self.look_gl.draw(plan, src, flip_in, target, x0, y0, dw, dh, True, self._frame_no)
@@ -1326,7 +1513,8 @@ class GLWindowSink:
             self.fsr.draw(self.tex, self.w, self.h, target, x0, y0, dw, dh)
             GL.glViewport(0, 0, fw, fh)
         elif upscale and mode == "vsr":
-            self._vsr_draw(x0, y0, dw, dh)
+            self._vsr_draw(target, x0, y0, dw, dh, frame if direct_vsr else None)
+            GL.glViewport(0, 0, fw, fh)
         else:
             self._plain(x0, y0, dw, dh)
         if pano:
@@ -1357,12 +1545,16 @@ class GLWindowSink:
         self.blitter.copy(self.tex, self.w, self.h, self.fbo, (0, 0, self.w, self.h), (x0, y0 + dh, x0 + dw, y0),
                           True)
 
-    def _vsr_draw(self, x0: int, y0: int, dw: int, dh: int) -> None:
-        """RTX VSR from the staged RGBA frame straight into a window-sized GL texture, then a 1:1 blit."""
-        tex, fbo = self._vsr_render(dw, dh)
+    def _vsr_draw(self, target: int, x0: int, y0: int, dw: int, dh: int, frame=None) -> None:
+        """RTX VSR from the staged RGBA frame (or direct frame) straight into a window-sized GL texture, then either
+        an RCAS sharpening pass or a 1:1 blit."""
+        tex, fbo = self._vsr_render(dw, dh, frame)
+        if (sharp := self._vsr_rcas()) is not None:
+            self.fsr.sharpen(tex, target, x0, y0, dw, dh, sharp)
+            return
         self.blitter.copy(tex, dw, dh, fbo, (0, 0, dw, dh), (x0, y0 + dh, x0 + dw, y0), False)
 
-    def _vsr_render(self, dw: int, dh: int) -> tuple[int, int]:
+    def _vsr_render(self, dw: int, dh: int, frame=None) -> tuple[int, int]:
         """RTX VSR into the window-sized texture (row 0 = the image's top); returns (texture, framebuffer)."""
         if self.vsr_out is None or self.vsr_out[3:5] != (dw, dh):
             self._vsr_target(dw, dh)
@@ -1370,7 +1562,7 @@ class GLWindowSink:
         stream = self.vsr.stream.cuda_stream
         arr = img.map(stream)
         try:
-            self.vsr(self.interop.rgba, arr, dw, dh)
+            self.vsr(frame if frame is not None else self.interop.rgba, arr, dw, dh)
         finally:
             img.unmap(stream)  # orders GL's read after VSR's write, no CPU wait
         return tex, fbo
@@ -1402,6 +1594,7 @@ class GLWindowSink:
         self.vsr_out = (tex, fbo, CudaGLImage(int(store)), w, h, store)
 
     def _vsr_target_free(self) -> None:
+        self._last_was_vsr = False
         if self.vsr_out is not None:
             tex, fbo, img = self.vsr_out[:3]
             if img.array.value:
@@ -1482,6 +1675,12 @@ class GLWindowSink:
             GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, GL.GL_TEXTURE_2D, tex, 0)
             self._bake = (tex, fbo, CudaGLReader(int(tex), self.w, self.h))
         tex, fbo, reader = self._bake
+        if self._last_was_vsr:
+            if _is_rgb10a2(frame):
+                from .vfg import unpack_rgb10a2
+                frame = unpack_rgb10a2(frame.view(torch.int32), hdr=self.hdr10)
+            self.interop.upload(frame)
+            self._last_was_vsr = False
         self.look_gl.draw(plan, self.tex, False, fbo, 0, 0, self.w, self.h, False, self._frame_no, "bake")
         GL.glViewport(0, 0, *self.glfw.get_framebuffer_size(self.win))
         rgba = torch.empty((self.h, self.w, 4), dtype=torch.uint8, device=frame.device)
@@ -1534,6 +1733,8 @@ class GLWindowSink:
         if self.interop is not None:
             self.interop.close()
         if self.dx is not None:
+            if seen := self.dx.times.summary():  # what the display did, not what was sent (GetFrameStatistics)
+                print(f"[display] on screen ({self.sync.describe(*self._sync_key[:2])}): {seen}")
             self.dx.close()
             self.glfw.destroy_window(self.glwin)
         self.glfw.destroy_window(self.win)
@@ -1611,6 +1812,18 @@ class MultiSink:
         for s in self.sinks:
             cmd = s.write(frame, text) or cmd
         return cmd
+
+    @property
+    def paced_by_display(self) -> bool:
+        return any(getattr(s, "paced_by_display", False) for s in self.sinks)
+
+    @property
+    def rgb10a2_vsr(self) -> bool:
+        return bool(self.sinks) and all(getattr(s, "rgb10a2_vsr", False) for s in self.sinks)
+
+    @property
+    def last_wait_s(self) -> float:
+        return sum(getattr(s, "last_wait_s", 0.0) for s in self.sinks)
 
     def wait(self, w: Waiting) -> str | None:
         cmd = None

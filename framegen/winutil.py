@@ -8,6 +8,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import time
 
 # SW_SHOWMINNOACTIVE minimises without activating another window (SW_MINIMIZE activates the next one in line, which
 # can take the keys away from the video window).
@@ -207,3 +208,38 @@ def boost_gpu() -> bool:
         return status == 0
     except (OSError, AttributeError):
         return False
+
+
+def high_res_timer(on: bool = True) -> bool:
+    """Requests a 1 ms Windows system timer resolution (timeBeginPeriod/timeEndPeriod) so short pacing
+    sleeps wake on time instead of overshooting by up to 15.6 ms. Returns whether the call succeeded."""
+    if sys.platform != "win32":
+        return False
+    try:
+        winmm = ctypes.WinDLL("winmm")
+        fn = winmm.timeBeginPeriod if on else winmm.timeEndPeriod
+        fn.argtypes = [ctypes.c_uint]
+        fn.restype = ctypes.c_uint
+        return fn(1) == 0
+    except (OSError, AttributeError):
+        return False
+
+
+def sleep_until(deadline: float, clock=time.perf_counter, sleep=time.sleep, spin_s: float = 0.002) -> float:
+    """Sleep until `deadline`, using OS sleep for the coarse wait and a short busy-wait for the last ~2 ms
+    so frame presentation lands with sub-millisecond jitter. Mocked `sleep` calls bypass spinning.
+
+    The busy-wait yields the GIL on every pass (time.sleep(0)): a bare `pass` loop would hold it for the whole
+    spin, so another Python thread (Clock60's reader handing in a frame that just arrived) couldn't run until the
+    deadline, and the frame would miss the beat it came in time for."""
+    rem = deadline - clock()
+    if rem <= 0:
+        return clock()
+    if sleep is not time.sleep or spin_s <= 0:
+        sleep(rem)
+        return clock()
+    if rem > spin_s + 0.0005:
+        sleep(rem - spin_s)
+    while (now := clock()) < deadline:
+        time.sleep(0)  # let waiting threads have the GIL; returns at once when none is waiting
+    return now

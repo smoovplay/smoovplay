@@ -202,6 +202,12 @@ SPECS: tuple[Spec, ...] = (
               "for clean video.",
          impact={"picture": "Higher is cleaner and sharper.",
                  "speed": "Each step up asks more of the GPU."}),
+    Spec("vsr_sharpness", "RTX VSR sharpening (RCAS)", ("off", 0.0, 0.25, 0.5, 1.0), "off",
+         {"off": "Off", 0.0: "Max", 0.25: "High", 0.5: "Medium", 1.0: "Low"},
+         group="Picture", applies=("scaler", ("vsr",)),
+         help="Runs AMD FSR 1's contrast-adaptive sharpening (RCAS, ~0.3 ms) after RTX VSR to restore crispness to "
+              "distant edges and fine textures without amplifying compression blocks.",
+         impact={"picture": "Crisper distant edges after RTX VSR.", "speed": "About 0.3 ms a frame."}),
     # framegen/hdr.py. Off by default, and then nothing changes: an HDR stream comes out washed out, and SmoovPlay says
     # so. "hdr10" needs the DXGI presentation (NVIDIA) and Windows' HDR; without them run.py uses "sdr" for the session.
     Spec("hdr", "HDR", ("off", "sdr", "hdr10"), "off",
@@ -265,22 +271,30 @@ SPECS: tuple[Spec, ...] = (
               "of the game to show. They crop or stretch the same 16:9 picture. Key: Z.",
          impact={"picture": "The same 16:9 picture, cropped or stretched: consoles send 16:9 only.",
                  "speed": "No real difference. Panorama adds one pass over the screen: about 0.02 ms."}),
+    # framegen/display_sync.py: how frames line up with the display's refreshes.
     Spec("vsync", "VSync", (False, True), False, ON_OFF, group="Display",
-         help="Off: the lowest delay, but fast camera turns can show a tear line across the picture. On: no "
-              "tearing, with a little more delay. With a G-Sync or FreeSync display, On gives you both: no tearing "
-              "and low delay.",
-         impact={"picture": "On: no tear lines.", "speed": "On can add up to one refresh of delay: 8 ms at 120 Hz, 17 at 60."}),
+         help="On: each frame starts on a screen refresh, so no tear lines, and when the display's refresh rate is a "
+              "multiple of the output rate (60 fps on 60, 120 or 240 Hz) every frame stays up equally long. Off: the "
+              "lowest delay, but fast camera turns can show a tear line. With G-Sync or FreeSync, turn that on below "
+              "instead.",
+         impact={"picture": "On: no tear lines, and even frames when the refresh rate fits.",
+                 "speed": "On can add up to one refresh of delay: 8 ms at 120 Hz, 17 at 60."}),
+    Spec("vrr", "G-Sync / FreeSync", (False, True), False, ON_OFF, group="Display",
+         help="Turn on if your display has G-Sync or FreeSync and it's on in the graphics card's settings: each frame "
+              "is then shown the moment it's ready, and the display follows. Windows can't tell SmoovPlay whether "
+              "it's on. In a window it needs Window presentation: Low delay.",
+         impact={"picture": "No tear lines and even frames on any refresh rate, when the display has it.",
+                 "speed": "The lowest delay without tearing."}),
     # framegen/dxgi_present.py. Standard stays the default until Low delay has been measured on more PCs.
     Spec("present", "Window presentation", ("gl", "dxgi"), "gl", {"gl": "Standard", "dxgi": "Low delay (Experimental)"},
-         live=False, group="Display", applies=("fullscreen", (False,)),
+         live=False, group="Display",
          hints={"gl": "OpenGL's own way. Tested. In a window, Windows adds a copy of each frame.",
-                "dxgi": "Hands frames over the way games do, so a window is about as quick as fullscreen and G-Sync "
-                        "works. Experimental."},
-         help="How the video reaches the screen. In a window, Standard goes through the Windows compositor, which "
-              "adds about 12 ms and keeps G-Sync and FreeSync from working. Low delay hands frames over the way games "
-              "do, for playing in a window; fullscreen uses Standard, as quick there. With Windows' HDR on, it's always "
-              "Low delay, so fullscreen keeps HDR on. Experimental; applies the next time you press Play.",
-         impact={"speed": "Low delay should save the 12 ms a window adds. Still being measured."}),
+                "dxgi": "Hands frames over the way games do, so a window or overlay is as quick as fullscreen and "
+                        "G-Sync works. Experimental."},
+         help="Standard goes through Windows' compositor in a window (about 12 ms delay, no G-Sync/FreeSync). "
+              "Low delay uses DXGI flip model so windows and App window overlays get G-Sync/FreeSync and lower delay. "
+              "Experimental; applies next Play.",
+         impact={"speed": "Low delay saves about 12 ms in a window and enables G-Sync/FreeSync."}),
     Spec("overlay", "Stats overlay", (True, False), True, ON_OFF, group="Display",
          help="Numbers in a corner of the video: how many frames a second are on screen, the game's own frame rate, "
               "and whether your PC keeps up. Key: S (Off, Minimal, Detailed)."),

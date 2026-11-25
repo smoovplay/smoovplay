@@ -74,7 +74,10 @@ class VfgInterpolator:
         self.hdr = hdr
         self.frame_dtype = torch.float16 if hdr else torch.uint8
         self.inp = torch.zeros((height, width, 3), dtype=self.frame_dtype, device=self.device)
-        self.out_u8 = torch.zeros((height, width, 3), dtype=self.frame_dtype, device=self.device)
+        self._out_u8 = torch.zeros((height, width, 3), dtype=self.frame_dtype, device=self.device)
+        self.out_rgb10a2 = torch.zeros((height, width), dtype=torch.int32, device=self.device) if encoding == "rgb10a2" else None
+        self._out_u8_dirty = False
+        self.rgb10a2_out = False
         self.in_u8 = torch.zeros((height, width, 3), dtype=torch.uint8, device=self.device) if hdr else self.inp
         if encoding == "rgb10a2":
             self.slots = [torch.zeros((height, width), dtype=torch.int32, device=self.device) for _ in range(2)]
@@ -84,6 +87,25 @@ class VfgInterpolator:
         # as (1, 3, h, w) RGB halves beside VFG's own copies.
         self.steady, self.hud, self.real = 0.0, None, None
         self._slot: int | None = None  # the newest prepared slot
+        self.warm_up()
+
+    @torch.no_grad()
+    def warm_up(self) -> None:
+        """Run one dummy interpolation pass at startup so CUDA/VFX kernels and allocations are ready before tick 1."""
+        prev, cur = self.slots[0], self.slots[1]
+        if self.encoding == "rgb10a2":
+            prev, cur = prev.view(torch.uint32), cur.view(torch.uint32)
+        stream = torch.cuda.current_stream(self.device)
+        self.fx.run_at_timestep(prev, cur, 0.5, stream_ptr=stream.cuda_stream)
+        stream.synchronize()
+
+    @property
+    def out_u8(self) -> torch.Tensor:
+        """HxWx3 BGR output buffer, unpacked lazily when RGB10A2 passthrough is active."""
+        if self._out_u8_dirty:
+            self._out_u8.copy_(unpack_rgb10a2(self.out_rgb10a2, hdr=self.hdr))
+            self._out_u8_dirty = False
+        return self._out_u8
 
     # ---- the RifeInterpolator interface --------------------------------------------------------------------
     def load(self, frame_u8: torch.Tensor) -> None:
@@ -98,7 +120,7 @@ class VfgInterpolator:
         """Convert the input into slot `slot` (0/1) in VFG's input format; with Steady HUD on, also where it acts
         between the previous real frame and this one."""
         if self.encoding == "rgb10a2":
-            self.slots[slot].copy_(pack_rgb10a2(self.inp))
+            pack_rgb10a2(self.inp, out=self.slots[slot])
         elif self.hdr:
             self.slots[slot].copy_(self.inp.permute(2, 0, 1).flip(0).float())
         else:
@@ -110,24 +132,32 @@ class VfgInterpolator:
 
     @torch.no_grad()
     def interpolate(self, newest_slot: int, t: float = 0.5) -> torch.Tensor:
-        """Frame at fraction t from slot (1-newest_slot) to newest_slot -> `out_u8` (overwritten each call)."""
+        """Frame at fraction t from slot (1-newest_slot) to newest_slot -> `out_u8` (or `out_rgb10a2` when
+        rgb10a2_out is enabled, overwritten each call)."""
         prev, cur = self.slots[1 - newest_slot], self.slots[newest_slot]
         stream = torch.cuda.current_stream(self.device).cuda_stream
         if self.encoding == "rgb10a2":
             prev, cur = prev.view(torch.uint32), cur.view(torch.uint32)
         out = self.fx.run_at_timestep(prev, cur, t, stream_ptr=stream)
-        img = torch.from_dlpack(out.image)  # SDK-owned memory: converted (copied) into out_u8 before the next run
+        img = torch.from_dlpack(out.image)  # SDK-owned memory: copied before the next run
         if self.encoding == "rgb10a2":
-            self.out_u8.copy_(unpack_rgb10a2(img.view(torch.int32), hdr=self.hdr))
+            if self.rgb10a2_out and not self.hdr and self.steady <= 0:
+                self.out_rgb10a2.copy_(img.view(torch.int32))
+                self._out_u8_dirty = True
+                return self.out_rgb10a2
+            self._out_u8.copy_(unpack_rgb10a2(img.view(torch.int32), hdr=self.hdr))
+            self._out_u8_dirty = False
         elif self.hdr:
-            self.out_u8.copy_(img.clamp(0.0, 1.0).flip(0).permute(1, 2, 0))
+            self._out_u8.copy_(img.clamp(0.0, 1.0).flip(0).permute(1, 2, 0))
+            self._out_u8_dirty = False
         else:
-            self.out_u8.copy_(img.clamp(0.0, 1.0).mul(255.0).round_().to(torch.uint8).flip(0).permute(1, 2, 0))
+            self._out_u8.copy_(img.clamp(0.0, 1.0).mul(255.0).round_().to(torch.uint8).flip(0).permute(1, 2, 0))
+            self._out_u8_dirty = False
         if self.steady > 0:  # Steady HUD: the real pixels where the HUD is
             self.hud.t_now.fill_(t)
-            mid = self.hud.blend(_rgb(self.out_u8, self.hdr), self.real[1 - newest_slot], self.real[newest_slot])
-            _store(mid, self.out_u8)
-        return self.out_u8
+            mid = self.hud.blend(_rgb(self._out_u8, self.hdr), self.real[1 - newest_slot], self.real[newest_slot])
+            _store(mid, self._out_u8)
+        return self._out_u8
 
     @torch.no_grad()
     def set_steady(self, threshold: float) -> None:
@@ -173,7 +203,7 @@ def _store(rgb: torch.Tensor, out: torch.Tensor) -> None:
 
 
 # ---- packed 10-bit RGB: R in bits 0-9, G 10-19, B 20-29, alpha 30-31 (left 0, so it fits a signed int32) ------
-def pack_rgb10a2(bgr: torch.Tensor) -> torch.Tensor:
+def pack_rgb10a2(bgr: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """HxWx3 BGR -> HxW int32 holding packed RGB10A2. uint8 values are widened exactly (v10 = v8 * 1023 / 255);
     float ones (0..1, hdr's pq16) rounded to 10 bits."""
     if bgr.is_floating_point():
@@ -181,6 +211,8 @@ def pack_rgb10a2(bgr: torch.Tensor) -> torch.Tensor:
     else:
         v = bgr.to(torch.int32)
         v = (v << 2) | (v >> 6)  # 8 -> 10 bits, 255 -> 1023
+    if out is not None:
+        return torch.bitwise_or(v[..., 2] | (v[..., 1] << 10), v[..., 0] << 20, out=out)
     return v[..., 2] | (v[..., 1] << 10) | (v[..., 0] << 20)
 
 

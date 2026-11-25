@@ -3,7 +3,7 @@ package takes. The upscaling itself needs an RTX card and NVIDIA's package: chec
 import torch
 
 from framegen import rtxvsr
-from framegen.rtxvsr import CLEAN, VfxVsr, pack_rgba10
+from framegen.rtxvsr import CLEAN, VfxVsr, pack_bgr10, pack_rgba10
 
 
 def _fields(packed):
@@ -75,3 +75,110 @@ def test_a_broken_package_check_never_stops_the_window(monkeypatch):
 def test_only_the_sdk_way_may_log_its_timings():
     assert VfxVsr.private and not rtxvsr.RtxVsr.private  # NVIDIA's package's licence: no published benchmarks
     assert VfxVsr.out_format == "rgb10a2" and rtxvsr.RtxVsr.out_format == "rgba8"
+    assert VfxVsr.in_format == "rgb10a2" and rtxvsr.RtxVsr.in_format == "rgba8"
+
+
+def test_pack_bgr10_matches_pack_rgba10_for_all_8bit_and_float():
+    v = torch.arange(256, dtype=torch.uint8)
+    rgba = torch.stack([v, v.flip(0), ((v.int() * 7) % 256).to(torch.uint8), v], -1).reshape(16, 16, 4)
+    bgr = rgba[..., [2, 1, 0]]
+    out_rgba = torch.empty((16, 16), dtype=torch.int32)
+    out_bgr = torch.empty((16, 16), dtype=torch.int32)
+    assert torch.equal(pack_bgr10(bgr, out_bgr), pack_rgba10(rgba, out_rgba))
+
+    f_rgba = torch.tensor([[[0.0, 0.5, 1.0, 1.0], [1.2, -0.1, 0.25, 1.0]]], dtype=torch.float16)
+    f_bgr = f_rgba[..., [2, 1, 0]]
+    assert torch.equal(pack_bgr10(f_bgr, torch.empty((1, 2), dtype=torch.int32)),
+                       pack_rgba10(f_rgba, torch.empty((1, 2), dtype=torch.int32)))
+
+
+def test_vfx_vsr_accepts_rgb10a2_bgr_and_rgba(monkeypatch):
+    if not torch.cuda.is_available():
+        return
+    import ctypes
+    from types import SimpleNamespace
+    from framegen import vfg
+
+    seen = []
+
+    class _FakeVsrFx:
+        def __init__(self, **kw):
+            self.output_width = 0
+            self.output_height = 0
+
+        def load(self):
+            pass
+
+        def run(self, src, non_blocking=True, stream_ptr=None):
+            seen.append(src.clone())
+            return SimpleNamespace(image=torch.zeros((self.output_height, self.output_width),
+                                                     dtype=torch.int32, device="cuda"))
+
+        def close(self):
+            pass
+
+    fake_vfx = SimpleNamespace(ImageEncoding=SimpleNamespace(RGB10A2=0), VideoSuperRes=_FakeVsrFx)
+    monkeypatch.setattr(vfg, "import_vfx", lambda: fake_vfx)
+    monkeypatch.setattr(rtxvsr, "vfx_reason", lambda: None)
+    monkeypatch.setattr(rtxvsr, "_cudart", lambda: SimpleNamespace(
+        cudaMemcpy2DToArrayAsync=SimpleNamespace(argtypes=None),
+        __call__=None,
+    ))
+    vsr = VfxVsr(8, 4, quality=2)
+    vsr.rt = SimpleNamespace(cudaMemcpy2DToArrayAsync=lambda *a: 0)
+
+    # 1. Direct RGB10A2 passthrough (preserves arbitrary 10-bit value 513)
+    rgb10 = torch.full((4, 8), 513, dtype=torch.int32, device="cuda")
+    vsr(rgb10, ctypes.c_void_p(1), 16, 8)
+    assert seen[-1].dtype == torch.uint32 and int(seen[-1][0, 0]) == 513
+
+    # 2. Direct BGR uint8
+    bgr = torch.zeros((4, 8, 3), dtype=torch.uint8, device="cuda")
+    bgr[..., 2] = 255
+    vsr(bgr, ctypes.c_void_p(1), 16, 8)
+    assert int(seen[-1][0, 0]) & 1023 == 1023
+
+    # 3. RGBA uint8
+    rgba = torch.zeros((4, 8, 4), dtype=torch.uint8, device="cuda")
+    rgba[..., 0] = 255
+    vsr(rgba, ctypes.c_void_p(1), 16, 8)
+    assert int(seen[-1][0, 0]) & 1023 == 1023
+
+
+def test_vfx_vsr_prewarms_on_init_and_dedups_same_size(monkeypatch):
+    if not torch.cuda.is_available():
+        return
+    from types import SimpleNamespace
+    from framegen import vfg
+
+    runs = []
+
+    class _FakeVsrWarm:
+        def __init__(self, **kw):
+            self.output_width = 0
+            self.output_height = 0
+
+        def load(self):
+            pass
+
+        def run(self, src, non_blocking=True, stream_ptr=None):
+            runs.append((self.output_width, self.output_height))
+            return SimpleNamespace(image=torch.zeros((self.output_height, self.output_width),
+                                                     dtype=torch.int32, device="cuda"))
+
+        def close(self):
+            pass
+
+    fake_vfx = SimpleNamespace(ImageEncoding=SimpleNamespace(RGB10A2=0), VideoSuperRes=_FakeVsrWarm)
+    monkeypatch.setattr(vfg, "import_vfx", lambda: fake_vfx)
+    monkeypatch.setattr(rtxvsr, "vfx_reason", lambda: None)
+    monkeypatch.setattr(rtxvsr, "_cudart", lambda: SimpleNamespace(
+        cudaMemcpy2DToArrayAsync=SimpleNamespace(argtypes=None),
+    ))
+    vsr = VfxVsr(8, 4, quality=2)
+    assert runs == [(16, 8)]
+    vsr.warm_up(16, 8)  # same size: no-op
+    assert runs == [(16, 8)]
+    vsr.warm_up(12, 6)  # new display size: warms once at new size
+    assert runs == [(16, 8), (12, 6)]
+    assert vsr.fx.output_width == 12 and vsr.fx.output_height == 6

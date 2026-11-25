@@ -90,3 +90,10 @@ def test_a_capture_cards_frames_dropped_from_the_queue_dont_move_the_rhythm():
     for i in keep:
         as_they_came.update(calls[i])
     assert as_they_came.moves >= 2  # what it did before
+
+
+def test_run_py_accepts_game_fps_flag():
+    import subprocess
+    import sys
+    out = subprocess.check_output([sys.executable, "run.py", "--help"], text=True)
+    assert "--game-fps {auto,30}" in out

@@ -16,3 +16,9 @@ promo/
 notes/
 scripts/make_clips.py
 scripts/render_demo.py
+
+# Build output of the Xbox WebView2 host and native Xbox client
+scripts/xbox_webview/bin/
+scripts/xbox_webview/obj/
+xbox_tap/smoovplay-xbox.exe
+xbox_tap/smoovplay-xbox

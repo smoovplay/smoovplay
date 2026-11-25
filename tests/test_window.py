@@ -467,7 +467,21 @@ def test_gpu_path_hands_on_its_frames_and_skips_quiet_moments(monkeypatch):
             src.close()
     assert [int(t.frame[0, 0, 0]) for t in ticks] == [1, 2, 3]
     assert [t.t_source for t in ticks] == [0.99, 1.99, 2.99]
+    assert [t.ready_event for t in ticks] == [None, None, None]
     assert caps[0].closed and not desk.opened
+
+    # 4-tuple grab() with a CUDA ready event propagates ready_event onto Tick
+    ev = object()
+
+    class _EventCap(_Cap):
+        def grab(self, timeout_ms):
+            got = super().grab(timeout_ms)
+            return (*got, ev) if got is not None else None
+
+    src2 = WindowSource(WINDOWS[0], size=(640, 360), gpu=lambda g, w, h: _EventCap([5]))
+    t = next(iter(src2))
+    src2.close()
+    assert int(t.frame[0, 0, 0]) == 5 and t.ready_event is ev
 
 
 def test_gpu_path_falls_back_to_the_cpu(monkeypatch):
