@@ -176,6 +176,43 @@ def test_the_capture_log_reports_once_a_minute_only_when_something_happened(caps
     assert "[capture] sound this session: ran dry 2 times" in capsys.readouterr().out
 
 
+def _clocks(late_a: float, late_v: float, n: int = 120):
+    import types
+    src = types.SimpleNamespace(_late_a=[late_a] * n, _late_v=[late_v] * n, _delay_s=None, _late_cal=None,
+                                player=types.SimpleNamespace(set_delay=lambda s: setattr(src, "set", s)))
+    for name in ("sound_lates", "sound_late_raw_s", "sound_late_s"):
+        setattr(src, name, types.MethodType(getattr(c.CardSource, name), src))
+    return src
+
+
+def test_the_clock_difference_is_measured_once_at_the_start_and_not_followed():
+    """Elgato HD60 X logs: the picture's timestamps drift about 40 ms a minute against the sound's, and following
+    that held the sound back 964 ms, then (bounded) a constant 80 ms too late."""
+    src = _clocks(0.023, 0.025)
+    assert src.sound_late_s() == pytest.approx(-0.002)
+    src._late_v = [0.155] * 120  # minutes later: the picture's clock has drifted
+    assert src.sound_late_s() == pytest.approx(-0.002)
+    c.CardSource.set_audio_delay(src, 40)
+    assert src.set == pytest.approx(0.042)
+    assert _clocks(0.0, 0.93).sound_late_s() == pytest.approx(-c.MAX_SOUND_LATE_S)  # a wild start is bounded
+    assert _clocks(0.0, 0.5, n=20).sound_late_s() == 0.0  # not enough to go on yet
+
+
+def test_the_log_says_when_the_cards_clocks_have_drifted_once_and_again_only_on_a_jump(capsys):
+    src = _clocks(0.023, 0.025)
+    src.sound_late_s()
+    c.CardSource._report_clocks(src)
+    assert capsys.readouterr().out == ""
+    for late in (0.155, 0.198, 0.241):  # the steady drift: said once
+        src._late_v = [late] * 120
+        c.CardSource._report_clocks(src)
+    out = capsys.readouterr().out
+    assert out.count("[capture] sound clock:") == 1 and "-130 ms off from the start" in out and "-2 ms" in out
+    src._late_v = [1.0] * 120  # a jump
+    c.CardSource._report_clocks(src)
+    assert capsys.readouterr().out.count("[capture] sound clock:") == 1
+
+
 def test_silence_until_the_delay_then_the_sound_in_order():
     line = DelayLine(RATE, CH)
     line.set_delay(0.1)

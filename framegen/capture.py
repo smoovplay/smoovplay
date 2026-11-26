@@ -386,6 +386,10 @@ def pick_mode(modes: list[Mode], w: int = 1920, h: int = 1080, fps: float = 60.0
     return best, "; ".join(notes)
 
 
+MAX_SOUND_LATE_S = 0.080  # the most sound_late_s() takes off (or adds to) the sound's delay
+CALIBRATION_N = 100  # packets of each (about 2 s) that sound_late_s() is measured on, once, at the start
+
+
 def open_options(mode: Mode, fps: float = 60.0, queue_frames: int = 4) -> dict:
     """av.open options for a mode. rtbufsize caps DirectShow's own queue at a few frames: it only fills when we fall
     behind, and frames dropped there are counted by FFmpeg ("real-time buffer too full")."""
@@ -754,6 +758,7 @@ class CardSource:
         if (now := time.perf_counter()) >= self._sound_report_t:
             self._sound_report_t = now + 60.0
             self._report_sound(final=False)
+            self._report_clocks()
 
     def _report_sound(self, final: bool) -> None:
         """Into the log: how the sound played (framegen.audio.sound_report), once a minute when something went
@@ -772,7 +777,26 @@ class CardSource:
         if line:
             print(f"[capture] sound{' this session' if final else ', last minute'}: {line}")
 
+    def _report_clocks(self) -> None:
+        """Into the log, once a minute at most and only when it's news: how late the card's sound and picture arrive
+        against their own timestamps now, against what sound_late_s() measured at the start. The picture's drifts
+        steadily (see sound_late_raw_s: about 43 ms a minute on an Elgato HD60 X, 150 lines in one long session), so
+        it's said the first time it's over 20 ms, and again only if it jumps (over 200 ms in a minute)."""
+        lates = self.sound_lates()
+        if lates is None:
+            return
+        drift = lates[0] - lates[1] - self.sound_late_raw_s()
+        last = getattr(self, "_clock_last", None)  # (None until it's been said once)
+        if last is not None or abs(drift) > 0.020:
+            self._clock_last = drift
+        if abs(drift) > 0.020 and (last is None or abs(drift - last) > 0.200):
+            print(f"[capture] sound clock: sound arrives {lates[0] * 1000:.0f} ms and picture {lates[1] * 1000:.0f} ms "
+                  f"after their timestamps, {drift * 1000:+.0f} ms off from the start" +
+                  (" (it drifts on, about 40 ms a minute on some cards; the sound's delay doesn't follow it: it uses "
+                   f"{self.sound_late_s() * 1000:+.0f} ms, measured at the start)" if last is None else ""))
+
     _delay_s: float | None = None
+    _late_cal: float | None = None
     _sound_report_t = 0.0
     _sound_seen: dict | None = None
     _rate, _channels = 48000, 2
@@ -784,11 +808,26 @@ class CardSource:
             out.append(self._replay_sound.popleft())
         return out
 
-    def sound_late_s(self) -> float:
-        """How much later the sound arrives than the picture, after their own timestamps (0 if not known)."""
+    def sound_lates(self) -> tuple[float, float] | None:
+        """(median lateness of the sound, of the picture), each against its own timestamps; None until known."""
         if len(self._late_v) < 10 or len(self._late_a) < 10:
-            return 0.0
-        return float(np.median(self._late_a) - np.median(self._late_v))
+            return None
+        return float(np.median(self._late_a)), float(np.median(self._late_v))
+
+    def sound_late_raw_s(self) -> float:
+        """How much later the sound arrives than the picture, after their own timestamps, the lateness of the
+        first CALIBRATION_N packets of each, then kept for the session (0 until known). The two clocks drift
+        apart afterwards (the card's picture by about 40 ms a minute: a console sends 59.94 Hz, the card numbers
+        its frames at 60), which is no delay of the picture's, so it's not followed."""
+        if self._late_cal is None:
+            if len(self._late_v) < CALIBRATION_N or len(self._late_a) < CALIBRATION_N:
+                return 0.0
+            self._late_cal = float(np.median(self._late_a) - np.median(self._late_v))
+        return self._late_cal
+
+    def sound_late_s(self) -> float:
+        """sound_late_raw_s(), kept within +-MAX_SOUND_LATE_S (a start-up hold-up could give a wild one)."""
+        return max(-MAX_SOUND_LATE_S, min(MAX_SOUND_LATE_S, self.sound_late_raw_s()))
 
     # The pipeline's side (as for chiaki-ng, framegen.chiaki_tap.ChiakiSource): the sound is held back to meet the
     # picture (Sound in sync); the delay test needs Remote Play.
