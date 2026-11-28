@@ -378,6 +378,7 @@ def test_a_card_with_no_sound_device_of_its_own_tries_its_video_device_for_sound
                                                     c.Device("Microphone (USB Audio)", "audio")])
     monkeypatch.setattr(c.CardSource, "open", classmethod(lambda cls, *args, **kw: kw))
     monkeypatch.setattr(run, "sound_player", lambda: object())
+    monkeypatch.setattr(run, "MAC_CAPTURE", False)  # DirectShow's way of picking the sound, wherever this runs
     a = types.SimpleNamespace(capture_backend="pyav", capture_colour="auto", capture_audio="auto", capture=name,
                               capture_format="auto", capture_fps=60.0)
     assert run.open_capture(a, 1920, 1080, None)["audio_device"] == name

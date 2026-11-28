@@ -1,4 +1,4 @@
-"""Minimise and restore another program's windows (Windows; does nothing elsewhere).
+"""Minimise and restore another program's windows (Windows; does nothing elsewhere), and keep the screen on.
 
 Used to minimise chiaki-ng while the pipeline's window is in front: chiaki-ng keeps streaming, decoding and
 reading the controller, but stops drawing video nobody sees, which otherwise takes GPU time from RIFE.
@@ -155,7 +155,17 @@ def _boost_off() -> bool:
 
 def boost_thread(task: str = "Games") -> bool:
     """Registers the calling thread with Windows' multimedia class scheduler (MMCSS) under `task`, at high
-    priority, so it gets the CPU on time. Lasts until the thread ends. Returns whether it worked."""
+    priority, so it gets the CPU on time. Lasts until the thread ends. Returns whether it worked.
+
+    On a Mac the thread's quality of service becomes user-interactive, the class macOS keeps on the performance
+    cores for work that's on screen right now."""
+    if sys.platform == "darwin" and os.environ.get("FRAMEGEN_NO_BOOST") != "1":
+        try:
+            qos = ctypes.CDLL(None).pthread_set_qos_class_self_np
+            qos.argtypes, qos.restype = [ctypes.c_uint, ctypes.c_int], ctypes.c_int
+            return qos(_QOS_CLASS_USER_INTERACTIVE, 0) == 0
+        except (OSError, AttributeError):
+            return False
     if _boost_off():
         return False
     try:
@@ -174,13 +184,18 @@ def boost_thread(task: str = "Games") -> bool:
 
 
 _ES_SYSTEM_REQUIRED, _ES_DISPLAY_REQUIRED, _ES_CONTINUOUS = 0x1, 0x2, 0x80000000
+_QOS_CLASS_USER_INTERACTIVE = 0x21  # <sys/qos.h>
 
 
 def keep_screen_on(on: bool = True) -> bool:
     """While the video plays, Windows doesn't turn the screen off or sleep, as video players and games ask. Without
     it, the power plan's "Turn off display after" (15 minutes, often) blanks the screen mid-game, because a controller
     isn't input to Windows: only a keyboard or a mouse is (chiaki-ng only asks on Linux). Lasts until the calling
-    thread ends or calls again with on=False. Returns whether it worked."""
+    thread ends or calls again with on=False. Returns whether it worked.
+
+    On a Mac, `caffeinate -d -i` does the same while this process runs, and on=False stops it."""
+    if sys.platform == "darwin":
+        return _caffeinate(on)
     if sys.platform != "win32":
         return False
     try:
@@ -189,6 +204,27 @@ def keep_screen_on(on: bool = True) -> bool:
         k32.SetThreadExecutionState.argtypes = [ctypes.c_uint32]
         flags = _ES_CONTINUOUS | (_ES_DISPLAY_REQUIRED | _ES_SYSTEM_REQUIRED if on else 0)
         return k32.SetThreadExecutionState(flags) != 0
+    except OSError:
+        return False
+
+
+_caffeinated = None  # macOS: the running `caffeinate` (keep_screen_on)
+
+
+def _caffeinate(on: bool) -> bool:
+    global _caffeinated
+    import subprocess
+    if not on:
+        if _caffeinated is not None:
+            _caffeinated.terminate()
+            _caffeinated = None
+        return True
+    if _caffeinated is not None and _caffeinated.poll() is None:
+        return True
+    try:  # with -w it ends by itself when this process does, even if on=False never comes
+        _caffeinated = subprocess.Popen(["caffeinate", "-d", "-i", "-w", str(os.getpid())],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
     except OSError:
         return False
 

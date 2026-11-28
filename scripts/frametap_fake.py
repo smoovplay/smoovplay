@@ -13,6 +13,11 @@ as it's due, as chiaki-ng's does, for instant replay; --no-sound leaves it out (
 
 --hdr sends what a PS5 in HDR does (chiaki-ng's H.265 HDR codec): 10-bit HEVC in HDR10 (PQ, BT.2020), made from the
 SDR clip by framegen.hdr.expand_sdr (SDR white at 203 nits, highlights up to --peak nits), for SmoovPlay's HDR setting.
+
+On a Mac it's the same with .venv/bin/python. The tap is POSIX shared memory there, so --tap NAME (and run.py's
+--chiaki-tap NAME) can have at most 24 characters after any Local\\, leaving room for the sound ring's "-audio".
+Without NVENC it encodes with libx264 or libx265, which keep up at 1080p60 on Apple's chips. The exception is --hdr,
+whose 10 bits go through VideoToolbox's encoder.
 """
 from __future__ import annotations
 
@@ -63,15 +68,17 @@ def sound_of(path: str, start: float, seconds: float) -> np.ndarray:
 
 def encoder(codec: str, w: int, h: int, mbps: float, sw: bool = False, hdr: bool = False):
     names = {"h264": ["h264_nvenc", "libx264"], "hevc": ["hevc_nvenc", "libx265"]}[codec]
+    if hdr and sys.platform == "darwin":  # libx265's 10 bits take about 35 ms a 1080p frame here, too slow for 60 Hz
+        names.insert(-1, "hevc_videotoolbox")
     if sw:
-        names = names[1:]
+        names = names[-1:]
     for name in names:
         try:
             ctx = av.CodecContext.create(name, "w")
         except Exception:
             continue
         ctx.width, ctx.height = w, h
-        ctx.pix_fmt = ("p010le" if "nvenc" in name else "yuv420p10le") if hdr else "yuv420p"
+        ctx.pix_fmt = ("p010le" if "nvenc" in name or "videotoolbox" in name else "yuv420p10le") if hdr else "yuv420p"
         if hdr:  # HDR10's tags, as a PS5 sends them
             ctx.color_primaries, ctx.color_trc, ctx.colorspace, ctx.color_range = 9, 16, 9, 1
         ctx.time_base, ctx.framerate = Fraction(1, 60), Fraction(60)
@@ -82,11 +89,22 @@ def encoder(codec: str, w: int, h: int, mbps: float, sw: bool = False, hdr: bool
             # delay=0: output each frame's packet right away, so loss/keyframe flags land on the right frame
             ctx.options = {"preset": "p4", "tune": "ull", "zerolatency": "1", "rc": "cbr", "forced-idr": "1",
                            "delay": "0", **({"profile": "main10"} if hdr else {})}
+        elif "videotoolbox" in name:
+            # low_delay turns on Apple's low-latency rate control, which puts out each frame's packet right away, so
+            # loss and keyframe flags land on the right frame. Without it packets come a few frames late, two at a time.
+            ctx.flags |= av.codec.context.Flags.low_delay
+            ctx.options = {"realtime": "1", "prio_speed": "1", **({"profile": "main10"} if hdr else {})}
         elif name == "libx264":
             ctx.options = {"preset": "veryfast", "tune": "zerolatency", "forced-idr": "1"}
         else:
             ctx.options = {"preset": "veryfast", "tune": "zerolatency", "x265-params": "repeat-headers=1" + (
                 ":colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited:hdr10=1" if hdr else "")}
+            if sys.platform == "darwin":
+                # A Mac has no NVENC, so libx265 answers the reader's keyframe requests (at the start, and after
+                # --loss). Its forced intra frame is otherwise a TRAIL picture that still lists earlier frames as
+                # references, so FFmpeg skips every frame after it until the next IRAP, up to 250 frames later. An
+                # IDR repairs the stream, as NVENC's forced-idr does on Windows.
+                ctx.options["forced-idr"] = "1"
         try:
             ctx.open()
         except Exception:
@@ -96,11 +114,13 @@ def encoder(codec: str, w: int, h: int, mbps: float, sw: bool = False, hdr: bool
 
 
 def make_hdr(enc, w: int, h: int, peak: float, sw: bool):
-    """fn(SDR frame) -> the same picture as an HDR10 frame for `enc` (framegen.hdr.expand_sdr, on the GPU unless sw)."""
+    """fn(SDR frame) -> the same picture as an HDR10 frame for `enc` (framegen.hdr.expand_sdr). It runs on the GPU
+    unless sw, so on CUDA, or on Apple's GPU on a Mac, where the CPU is three times too slow for a 1080p stream."""
     import torch
 
+    from framegen import gpu
     from framegen import hdr as H
-    dev = "cuda" if torch.cuda.is_available() and not sw else "cpu"
+    dev = gpu.device() if not sw else "cpu"
     pix = enc.pix_fmt
 
     def put(frame, arrays):
@@ -257,6 +277,9 @@ def main() -> int:
                     recover_next = False
                 lost_pending = 0
                 sizes["key" if key else ("repeat" if rep else "new")].append(len(data))
+        # The reader stops at a dead header with whatever it hasn't read still in the ring, so on a slow machine
+        # ending right after the last frame loses it the last few. Give it a moment to take them first.
+        tap.wait_read(1.0)
     finally:
         tap.end()
         if sound is not None:

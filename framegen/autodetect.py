@@ -41,6 +41,9 @@ VSR_MS = {1: 1.3, 2: 1.6, 3: 3.6, 4: 4.9}
 REF_HALF_MS = 6.8  # this test's half-motion time on that card: the yardstick for "the card's speed"
 REF_PIXELS = 2560 * 1440
 TRT_SPEEDUP = 0.88  # TensorRT's time at full motion detail vs PyTorch's, when its engine isn't built yet to time
+# On a Mac each frame shown also goes from the GPU to memory to OpenGL, as there's no CUDA-OpenGL interop, and is
+# then swapped. That's about 3 ms a frame on an M5 Max at 1080p, on top of this test's time.
+MAC_PRESENT_MS = 3.0
 # Frame rate and motion detail, best first. 90 fps at full detail beats 120 at half: in testing it looked better.
 OPTIONS = ((120, "full"), (90, "full"), (120, "half"), (90, "half"), (60, "full"), (60, "half"))
 VFG_QUALITIES = ("high", "medium", "low")  # NVIDIA VFG's modes, most careful first
@@ -63,12 +66,18 @@ def save_timing(settings_path: Path, gpu: str, timing: dict) -> None:
         pass
 
 
-def saved_full_ms(settings_path: Path, gpu: str) -> float | None:
+def saved_full_ms(settings_path: Path, gpu: str, engine: str | None = None) -> float | None:
     """The last test's time at full motion detail on this graphics card, in ms; None if there's none, or it was
-    another card's."""
+    another card's. engine: only a time measured with that engine counts. On a Mac another core can share the file
+    under the same GPU name with its own engine and times, which don't apply to this pipeline."""
     try:
         saved = json.loads(timing_path(settings_path).read_text(encoding="utf-8"))
-        return float(saved["timing"]["full"]["ms"]) if saved.get("gpu") == gpu else None
+        if saved.get("gpu") != gpu:
+            return None
+        full = saved["timing"]["full"]
+        if engine is not None and full.get("engine") != engine:
+            return None
+        return float(full["ms"])
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
@@ -95,7 +104,9 @@ class Display:
 
 
 def primary_display() -> Display | None:
-    """The main display (where the video window opens), or None if it can't be read (not Windows)."""
+    """The main display (where the video window opens), or None if it can't be read (not Windows or macOS)."""
+    if sys.platform == "darwin":
+        return _mac_display()
     if sys.platform != "win32":
         return None
     import ctypes
@@ -140,6 +151,28 @@ def primary_display() -> Display | None:
     return Display(now.dmPelsWidth, now.dmPelsHeight, now.dmDisplayFrequency, best)
 
 
+def _mac_display() -> Display | None:
+    """The Mac's main display, read through GLFW. Its size is in pixels, so a Retina display's points times its scale,
+    and a ProMotion display reports a refresh rate of 120. macOS runs a display at its top rate, so hz and max_hz are
+    the same."""
+    try:
+        import glfw
+        if not glfw.init():
+            return None
+        try:
+            mon = glfw.get_primary_monitor()
+            mode = glfw.get_video_mode(mon)
+            sx, sy = glfw.get_monitor_content_scale(mon)
+            same = [m.refresh_rate for m in glfw.get_video_modes(mon) if tuple(m.size) == tuple(mode.size)]
+            hz = int(round(mode.refresh_rate)) or 60
+            return Display(int(round(mode.size.width * sx)), int(round(mode.size.height * sy)), hz,
+                           max([hz] + [int(round(r)) for r in same]))
+        finally:
+            glfw.terminate()
+    except Exception:  # noqa: BLE001 - an unknown display, so recommend() assumes 60 Hz
+        return None
+
+
 def nvidia_smi(samples: int = 3) -> dict:
     """Driver version and how busy the card is (%), from nvidia-smi; {} if it isn't there. Busy is the lowest of a few
     readings half a second apart: a game keeps the card busy, a moment's work (like setup's own, just before) doesn't."""
@@ -166,11 +199,12 @@ def time_rife(model: str, log: Callable[[str], None] = print) -> dict:
     and TensorRT's time estimated from it."""
     import torch
 
+    from . import gpu
     from .interpolator import RifeInterpolator
     from .trt import auto_engine
 
     w, h = STREAM
-    frame = torch.randint(0, 256, (h, w, 3), dtype=torch.uint8, device="cuda")
+    frame = torch.randint(0, 256, (h, w, 3), dtype=torch.uint8, device=gpu.device())
     out = {}
     for motion, scale in (("full", 1.0), ("half", 0.5)):
         engine, estimated = auto_engine(scale), False
@@ -185,7 +219,7 @@ def time_rife(model: str, log: Callable[[str], None] = print) -> dict:
         ms = _time_ticks(it) * (TRT_SPEEDUP if estimated else 1.0)
         out[motion] = {"ms": round(ms, 2), "engine": engine, "estimated": estimated}
         del it
-        torch.cuda.empty_cache()
+        gpu.empty_cache()
     return out
 
 
@@ -218,24 +252,24 @@ def time_dml(model: str, log: Callable[[str], None] = print) -> dict:
 
 
 def _time_ticks(it) -> float:
-    """Median ms of one tick with a new real frame: prepare it (from `in_u8`) and draw the in-between frame."""
-    import torch
+    """Median ms of one tick with a new real frame: prepare it (from `in_u8`) and draw the in-between frame. Timed
+    with CUDA events on NVIDIA, and on a Mac's GPU with the clock around a synchronize (framegen/gpu.py timer)."""
+    from . import gpu
 
     def tick() -> None:
         it.prepare(1)
         it.interpolate(1, 0.5)
 
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start, stop = gpu.timer()
     rounds = []
     for r in range(7):  # the first two let the card's clocks come up from idle
-        torch.cuda.synchronize()
-        start.record()
+        gpu.synchronize()  # as before on CUDA, where start() only records an event
+        start()
         for _ in range(12):
             tick()
-        end.record()
-        torch.cuda.synchronize()
+        ms = stop()
         if r >= 2:
-            rounds.append(start.elapsed_time(end) / 12)
+            rounds.append(ms / 12)
     return sorted(rounds)[len(rounds) // 2]
 
 
@@ -280,6 +314,8 @@ def recommend(current: dict, timing: dict, display: Display | None, *, gpu: str 
     settings are suggested, the rest are left as they are. NVIDIA VFG is suggested when it's set up and keeps up at
     least as high a frame rate as RIFE: setting it up is the user's choice to use it."""
     share = LAPTOP_SHARE if "laptop" in gpu.lower() else SHARE
+    mac = gpu.startswith("Apple")  # detect() passes framegen/gpu.py's name()
+    present_ms = MAC_PRESENT_MS if mac else 0.0
     speed = timing["half"]["ms"] / REF_HALF_MS  # above 1 = slower than the card the numbers above come from
     pixels = display.width * display.height if display else REF_PIXELS
     enlarge = pixels > STREAM[0] * STREAM[1] * 1.05  # a 1080p display shows the stream as it is
@@ -288,7 +324,7 @@ def recommend(current: dict, timing: dict, display: Display | None, *, gpu: str 
     top = 120 if rate >= 119 else 90 if rate >= 89 else 60  # 119 = 119.88 Hz
 
     def cost(motion: str) -> float:
-        return timing[motion]["ms"] + fsr_ms
+        return timing[motion]["ms"] + fsr_ms + present_ms
 
     def fits(hz: int, motion: str) -> bool:
         return cost(motion) <= share * 1000 / hz
@@ -358,6 +394,9 @@ def recommend(current: dict, timing: dict, display: Display | None, *, gpu: str 
         reasons["engine"] = ("Without an NVIDIA card, RIFE runs through DirectML (Experimental). It's slower than "
                              "on an NVIDIA card of the same speed, and hasn't been tried with a game on AMD or Intel "
                              "graphics yet: Send feedback on the Help page says how it went.")
+    elif gpu.startswith("Apple"):  # a Mac (detect() passes framegen/gpu.py's name())
+        reasons["engine"] = ("On a Mac, RIFE runs through PyTorch on Apple's GPU (Metal). TensorRT is for NVIDIA "
+                             "cards only.")
     elif trt:
         reasons["engine"] = ("TensorRT is installed. Auto uses it at full motion detail and PyTorch at half: the "
                              "faster of the two for each.")
@@ -370,7 +409,7 @@ def recommend(current: dict, timing: dict, display: Display | None, *, gpu: str 
 
     _upscaler(settings, reasons, current=current, hz=hz, left=share * tick - timing[motion]["ms"], fsr_ms=fsr_ms,
               speed=speed, pixels=pixels, enlarge=enlarge, vsr=vsr, display=display)
-    _notes(notes, settings, display=display, hz=hz, rate=rate, share=share, busy=busy)
+    _notes(notes, settings, display=display, hz=hz, rate=rate, share=share, busy=busy, mac=mac)
     return {"settings": settings, "reasons": reasons, "notes": notes}
 
 
@@ -437,7 +476,7 @@ def _upscaler(settings: dict, reasons: dict, *, current: dict, hz: int, left: fl
 
 
 def _notes(notes: list, settings: dict, *, display: Display | None, hz: int, rate: int, share: float,
-           busy: int | None) -> None:
+           busy: int | None, mac: bool = False) -> None:
     if display is None:
         notes.append("Couldn't read the display's refresh rate, so this assumes 60 Hz.")
     elif display.max_hz > display.hz + 5:
@@ -446,7 +485,10 @@ def _notes(notes: list, settings: dict, *, display: Display | None, hz: int, rat
                      "smoother frame rate.")
     if display is not None and hz > 60 and rate % hz > 2 and hz - rate % hz > 2:
         notes.append(f"{_fps(hz)} doesn't divide evenly into your display's {rate} Hz, so keep G-Sync or FreeSync "
-                     "on (most fast displays have one) for even motion.")
+                     "on (most fast displays have one) for even motion." if not mac else
+                     f"{_fps(hz)} doesn't divide evenly into your display's {rate} Hz, so for even motion set its "
+                     "refresh rate to Variable in System Settings > Displays, if it offers that (most fast displays "
+                     "do).")
     if share == LAPTOP_SHARE:
         notes.append("Laptop graphics slow down as they warm up, so this leaves extra room.")
     if busy is not None and busy >= 30:
@@ -477,6 +519,15 @@ def vfg_offer(not_set_up: bool, gpu: str, driver: str | None) -> str:
     return text
 
 
+def _mac_memory_gb() -> float:
+    """A Mac's memory, which its GPU shares, in GB (0 if it can't be read)."""
+    try:
+        out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2).stdout
+        return int(out.strip()) / 2**30
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def vfg_driver_too_old(driver: str | None) -> bool:
     """Whether nvidia-smi's driver version (e.g. "566.36", always two digits after the point on Windows) is older than
     NVIDIA VFG's oldest. Unknown or in another form: False, and VFG itself says if it can't start."""
@@ -496,8 +547,13 @@ def detect(current: dict, log: Callable[[str], None] = print, timing: dict | Non
     smi = nvidia_smi()
     log("starting the graphics card")
     import torch
-    dml_mode = not torch.cuda.is_available()
-    if dml_mode:  # an AMD or Intel card: RIFE through DirectML (framegen/dml.py, Experimental)
+
+    from . import gpu as gpus
+    mac_mode = gpus.MAC and not torch.cuda.is_available()  # Apple's GPU, through PyTorch on Metal
+    dml_mode = not torch.cuda.is_available() and not mac_mode
+    if mac_mode:
+        gpu, vram = gpus.name(), _mac_memory_gb()
+    elif dml_mode:  # an AMD or Intel card: RIFE through DirectML (framegen/dml.py, Experimental)
         from . import dml
         why = dml.unavailable_reason()
         if why:
@@ -512,9 +568,9 @@ def detect(current: dict, log: Callable[[str], None] = print, timing: dict | Non
     from .trt import trt_available
     from .vfg import vfg_unavailable
     trt, vsr = trt_available(), unavailable_reason()
-    if dml_mode:
+    if dml_mode or mac_mode:
         trt, vsr = False, "it needs an NVIDIA RTX card"
-    vfg_why = "" if vfg is not None else vfg_unavailable()
+    vfg_why = "" if vfg is not None else "NVIDIA VFG needs an NVIDIA RTX card" if mac_mode else vfg_unavailable()
     model = current.get("model", BY_KEY["model"].default)
     model = BY_KEY["model"].default if model == "vfg" else model
     testing = timing is not None
@@ -531,19 +587,21 @@ def detect(current: dict, log: Callable[[str], None] = print, timing: dict | Non
                        vfg_why=vfg_why)
 
     name = gpu.replace("NVIDIA ", "").replace("GeForce ", "")
-    engines = {"trt": "TensorRT", "torch": "PyTorch", "dml": "DirectML (Experimental)"}
+    engines = {"trt": "TensorRT", "torch": "PyTorch on Metal" if mac_mode else "PyTorch",
+               "dml": "DirectML (Experimental)"}
+    nvidia_only = dml_mode or mac_mode
     full, half = timing["full"], timing["half"]
     result["found"] = [
-        {"label": "Graphics card", "value": f"{name}, {vram:.0f} GB",
+        {"label": "Graphics card", "value": f"{name}, {vram:.0f} GB{' shared' if mac_mode else ''}",
          "detail": f"Driver {smi['driver']}" if smi.get("driver") else ""},
         {"label": "AI speed", "value": f"{full['ms']:.1f} ms per in-between frame",
          "detail": f"Full motion detail, {engines[full['engine']]}{' (estimated)' if full['estimated'] else ''}. "
                    f"Half: {half['ms']:.1f} ms, {engines[half['engine']]}."},
         {"label": "Display", "value": f"{display.width}×{display.height} at {display.hz} Hz" if display else "Unknown",
          "detail": f"Can run at {display.max_hz} Hz" if display and display.max_hz > display.hz + 5 else ""},
-        {"label": "TensorRT", "value": "NVIDIA cards only" if dml_mode else "Installed" if trt else "Not installed",
+        {"label": "TensorRT", "value": "NVIDIA cards only" if nvidia_only else "Installed" if trt else "Not installed",
          "detail": ""},
-        {"label": "RTX VSR", "value": "NVIDIA cards only" if dml_mode else "Ready" if vsr is None else "Not set up",
+        {"label": "RTX VSR", "value": "NVIDIA cards only" if nvidia_only else "Ready" if vsr is None else "Not set up",
          "detail": ""},
     ]
     if vfg:  # on this PC's Settings page only (NVIDIA's licence: VFG's results aren't for publishing)

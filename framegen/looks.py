@@ -43,8 +43,11 @@ W709 = (0.2126, 0.7152, 0.0722)  # luma weights
 
 
 def looks_dir() -> Path:
+    """The user's looks folder: SMOOVPLAY_LOOKS_DIR, else beside the settings (framegen/paths.py). That's
+    %APPDATA%\\framegen\\looks on Windows and ~/Library/Application Support/framegen/looks on a Mac."""
+    from .paths import data_dir
     env = os.environ.get("SMOOVPLAY_LOOKS_DIR")
-    return Path(env) if env else Path(os.environ.get("APPDATA", Path.home())) / "framegen" / "looks"
+    return Path(env) if env else data_dir() / "looks"
 
 
 # ---------------------------------------------------------------------------------------------- the node types

@@ -1,5 +1,6 @@
 """HDR maths (framegen/hdr.py), on the CPU: PQ, the BT.2390 roll-off, BT.2020 colours, and decoded 10-bit frames
 turned into the pipeline's SDR (sdr8) and HDR10 (pq16) frames."""
+import sys
 from fractions import Fraction
 
 import av
@@ -229,6 +230,48 @@ def test_libx265_main10_round_trip():
     out = hdr.StreamConverter("sdr8", device="cpu")(frames[0])
     want = hdr.convert_yuv(*flat((yc, uc, vc), h, w), PQ, "sdr8")
     assert torch.equal(out, want)
+
+
+def test_hdr_stream_converter_goes_on_this_machines_gpu(capsys):
+    """Remote Play's HDR setting (ChiakiSource.set_hdr) tone-maps on CUDA, on Apple's GPU on a Mac, or else on the
+    CPU. It isn't tied to CUDA."""
+    from framegen import gpu
+    from framegen.chiaki_tap import ChiakiSource
+    src = ChiakiSource.__new__(ChiakiSource)  # only what set_hdr reads
+    src.app, src.tag, src.hdr_stream, src.convert = False, "[chiaki]", True, None
+    src.set_hdr("sdr8")
+    assert src.convert is not None and src.convert.out == "sdr8"
+    assert src.convert.device.type == gpu.device()
+
+
+@pytest.mark.skipif(not (sys.platform == "darwin" and torch.backends.mps.is_available()),
+                    reason="needs a Mac, for VideoToolbox and Apple's GPU")
+def test_videotoolbox_p010_tone_mapped_on_apples_gpu():
+    """What a Mac does with a PS5's HDR stream. VideoToolbox decodes the 10-bit HEVC to P010, and "sdr" tone-maps it
+    on Apple's GPU (MPS) the same as on the CPU."""
+    from av.codec.hwaccel import HWAccel
+    w, h = 256, 144
+    enc = av.CodecContext.create("libx265", "w")
+    enc.width, enc.height, enc.pix_fmt = w, h, "yuv420p10le"
+    enc.time_base, enc.framerate = Fraction(1, 60), Fraction(60)
+    enc.options = {"preset": "ultrafast", "x265-params": "log-level=none:colorprim=bt2020:transfer=smpte2084:"
+                   "colormatrix=bt2020nc"}
+    enc.open()
+    rng = np.random.default_rng(4)
+    packets = []
+    for i in range(3):
+        yc = rng.integers(64, 940, (h, w))
+        fr = p10_frame(yc, rng.integers(400, 624, (h // 2, w // 2)), rng.integers(400, 624, (h // 2, w // 2)))
+        fr.pts = i
+        packets += enc.encode(fr)
+    packets += enc.encode(None)
+    dec = av.CodecContext.create("hevc", "r", hwaccel=HWAccel("videotoolbox"))
+    frames = [f for p in packets for f in dec.decode(p)]
+    assert frames and frames[0].format.name == "p010le"  # VideoToolbox's, copied out to the CPU's (shared) memory
+    gpu_out = hdr.StreamConverter("sdr8", device="mps")(frames[0])
+    assert gpu_out.device.type == "mps" and gpu_out.shape == (h, w, 3) and gpu_out.dtype == torch.uint8
+    cpu_out = hdr.StreamConverter("sdr8", device="cpu")(frames[0])
+    assert (gpu_out.cpu().int() - cpu_out.int()).abs().max() <= 1
 
 
 # ---------------------------------------------------------------- HDR output: the pipeline carrying float16 frames

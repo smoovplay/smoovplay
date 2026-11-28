@@ -654,6 +654,9 @@ def _cuda() -> bool:
 
 def open_window(query: str) -> WindowSource:
     """--window QUERY: the window, or a clear error naming what was looked for."""
+    if sys.platform != "win32":
+        raise RuntimeError("window capture is Windows-only for now, because it reads the window through Desktop "
+                           "Duplication. On a Mac, use PS5 Remote Play through chiaki-ng or a video file")
     left_out: dict = {}
     target = pick(query, find_windows(left_out))
     if target is None:

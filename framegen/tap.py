@@ -32,6 +32,8 @@ from .io import Tick
 from .sync import CAPTURE_LOCK
 
 DEFAULT_NAME = "Local\\smoovplay-tap"  # chiaki-ng's is Local\chiaki-frametap
+# Compressed frames' decoder: NVDEC on Windows, Apple's VideoToolbox on a Mac (ChiakiSource._new_decoder)
+DEFAULT_DECODER = "videotoolbox" if sys.platform == "darwin" else "cuda"
 
 
 def wait_for_writer(tap: FrameTap, wait_s: float) -> Header:
@@ -47,12 +49,12 @@ def wait_for_writer(tap: FrameTap, wait_s: float) -> Header:
     return h
 
 
-def open_tap(name: str = DEFAULT_NAME, decoder: str = "cuda", wait_s: float = 600.0, test=None,
+def open_tap(name: str = DEFAULT_NAME, decoder: str = DEFAULT_DECODER, wait_s: float = 600.0, test=None,
              log_path: str | None = None):
     """(kind, source) for whatever the writer on `name` sends: ("chiaki", a ChiakiSource) for compressed frames,
     ("tap", a TapSource) for decoded ones, put on a 60 Hz beat if the writer sets FEATURE_VARIABLE. test: a
     framegen.sources.TestMode, for a writer that sends every refresh (left out for a variable one, and ValueError if
-    it's on)."""
+    it's on). decoder: for compressed frames, "cuda" (NVDEC), "videotoolbox" (a Mac), "d3d11va" or "sw"."""
     tap = FrameTap(name, name + "-frame")
     h = wait_for_writer(tap, wait_s)
     if h.codec in RAW_CODECS:

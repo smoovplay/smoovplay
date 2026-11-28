@@ -33,7 +33,7 @@ import numpy as np
 from .io import Tick
 from .streamcheck import StreamCheck
 from .sync import CAPTURE_LOCK
-from .tapsys import Signal, open_map, qpc, qpc_freq
+from .tapsys import Signal, open_map, qpc, qpc_freq, shm_name
 
 NAME = "Local\\chiaki-frametap"
 EVENT_NAME = "Local\\chiaki-frametap-frame"
@@ -193,6 +193,7 @@ class FrameTap:
     # Writer side, for tests, the fake PS5 (scripts/frametap_fake.py) and the decoded-frame sender
     # (scripts/frametap_send.py); chiaki-ng uses frametap.c.
     _slots, _slot_size = SLOTS, SLOT_SIZE
+    _last_push = 0  # when the last frame was pushed (qpc), for wait_read
 
     def begin(self, codec: int, width: int, height: int, max_fps: int = 60, colour: int = 0,
               features: int | None = None) -> None:
@@ -223,7 +224,8 @@ class FrameTap:
         size = min(n, self._slot_size - SLOT_HEADER)
         flags = (FLAG_TRUNCATED if size < n else 0) | {True: FLAG_NEW, False: FLAG_REPEAT, None: 0}[new]
         struct.pack_into("<Q", self.mm, off, U64_MAX)
-        struct.pack_into("<QIiII", self.mm, off + 8, qpc(), size, frames_lost, int(recovered), flags)
+        self._last_push = qpc()
+        struct.pack_into("<QIiII", self.mm, off + 8, self._last_push, size, frames_lost, int(recovered), flags)
         if isinstance(data, np.ndarray):
             np.frombuffer(self.mm, np.uint8, size, off + SLOT_HEADER)[:] = data.reshape(-1)[:size]
         else:
@@ -255,6 +257,18 @@ class FrameTap:
 
     def audio_delay_ms(self) -> int:
         return struct.unpack_from("<I", self.mm, 88)[0]
+
+    def wait_read(self, timeout_s: float) -> bool:
+        """Wait until the reader has taken the last frame pushed, or timeout_s passes: True if it has. The reader
+        writes its heartbeat while it waits for the next frame, so one newer than the last push means it has read
+        everything. For a writer about to end the stream: the reader stops at a dead header with whatever it
+        hasn't read still in the ring, and a slow machine (GitHub's shared Macs) can be several frames behind."""
+        t_end = time.perf_counter() + timeout_s
+        while struct.unpack_from("<Q", self.mm, 56)[0] < self._last_push:
+            if time.perf_counter() >= t_end:
+                return False
+            time.sleep(0.005)
+        return True
 
     def end(self) -> None:
         struct.pack_into("<I", self.mm, 0, 0)
@@ -471,13 +485,21 @@ class ChiakiSource:
         chiaki-ng's layout (framegen/tap.py open_tap): the log and notes say "[tap]" and "the app", not chiaki-ng."""
         from .sources import source_info
         self.app, self.tag = app, "[tap]" if app else "[chiaki]"
+        if sys.platform == "darwin":  # ValueError before any shared memory is made, if the sound ring's name won't fit
+            shm_name(tap_name + AUDIO_SUFFIX)
         self.tap = FrameTap(tap_name, tap_name + "-frame")
         self.sound = AudioTap(tap_name + AUDIO_SUFFIX)  # the game's sound, for instant replay
         self._sound_session: int | None = None
         self.test = test
         self._last_idr = 0.0
-        self._header_file = Path(tempfile.gettempdir()) / (tap_name.split("\\")[-1] + "-header.bin")
+        leaf = tap_name.split("\\")[-1]
+        if sys.platform != "win32":
+            leaf = leaf.lstrip("/")  # a POSIX name can be given as "/name"
+        self._header_file = Path(tempfile.gettempdir()) / (leaf + "-header.bin")
+        if sys.platform == "darwin" and decoder in ("cuda", "d3d11va"):
+            decoder = "videotoolbox"  # a Mac has neither, but has its own hardware decoder
         self.decoder_kind = decoder
+        self._vt_checked = False  # whether the first VideoToolbox picture has been checked (_check_vt)
         t_end = time.perf_counter() + wait_s
         printed = stale_said = False
         while True:
@@ -547,10 +569,37 @@ class ChiakiSource:
             # which takes turns on the GPU with RIFE; primary_ctx refuses because PyTorch set it up differently.
             ctx = av.CodecContext.create(codec, "r", hwaccel=HWAccel(
                 "cuda", options={"primary_ctx": "0", "current_ctx": "1"}, is_hw_owned=True))
+        elif self.decoder_kind == "videotoolbox":
+            # Apple's hardware decoder (H.264, and H.265 8- and 10-bit). FFmpeg copies each picture out as NV12 (P010
+            # for 10 bits) into memory the CPU reads, which on a Mac is the GPU's memory too, so it costs little.
+            # If VideoToolbox can't take a stream, FFmpeg decodes it in software instead (_check_vt says so).
+            try:
+                ctx = av.CodecContext.create(codec, "r", hwaccel=HWAccel("videotoolbox"))
+                if not ctx.is_hwaccel:
+                    raise RuntimeError(f"no VideoToolbox decoder for {codec}")
+            except Exception as e:  # noqa: BLE001 - the stream still plays, on the CPU
+                print(f"{self.tag} VideoToolbox can't decode here ({str(e)[:120]}), so decoding in software",
+                      file=sys.stderr)
+                self.decoder_kind = "sw"
+                return self._new_decoder(codec)
+            self._vt_checked = False
         else:
             ctx = av.CodecContext.create(codec, "r", hwaccel=HWAccel(self.decoder_kind))
         ctx.flags |= av.codec.context.Flags.low_delay
         return ctx
+
+    def _check_vt(self, frames) -> None:
+        """VideoToolbox's first pictures come out as NV12 or P010, and FFmpeg's software decoders give planar YUV. This
+        says so once if VideoToolbox turned the stream down and FFmpeg fell back to software."""
+        if self._vt_checked or not frames:
+            return
+        self._vt_checked = True
+        fmt = frames[0].format.name
+        if fmt in ("nv12", "p010le"):
+            print(f"{self.tag} decoding with VideoToolbox")
+        else:
+            print(f"{self.tag} VideoToolbox didn't take this stream ({fmt}), so FFmpeg decodes it in software",
+                  file=sys.stderr)
 
     def _reader(self) -> None:
         import av
@@ -670,6 +719,8 @@ class ChiakiSource:
                     frames = dec.decode(av.Packet(pending + p.data if pending else p.data))
                     images = [self._image(fr) for fr in frames]
                 pending, errors = b"", 0
+                if self.decoder_kind == "videotoolbox":
+                    self._check_vt(frames)
             except av.error.FFmpegError as e:
                 # Keep the decoder (it holds the header and reference frames) and hold the next few frames; the
                 # PS5 answers a keyframe request with a refresh frame.
@@ -731,9 +782,10 @@ class ChiakiSource:
             print(f"{self.tag} HDR is on in SmoovPlay's settings, but this stream isn't HDR: shown as usual."
                   + ("" if self.app else " (For HDR, pick chiaki-ng's H.265 HDR codec.)"))
             return
+        from . import gpu
         from .hdr import StreamConverter
-        import torch
-        self.convert = StreamConverter(out, "cuda" if torch.cuda.is_available() else "cpu", display_peak=display_peak)
+        # CUDA, else Apple's GPU on a Mac (about 3 ms a 1080p frame, where the CPU takes about 40), else the CPU
+        self.convert = StreamConverter(out, gpu.device(), display_peak=display_peak)
         print(f"{self.tag} HDR stream: " + ("kept HDR for the HDR display" if out == "pq16" else "shown in SDR")
               + " (HDR is Experimental)")
 

@@ -10,14 +10,14 @@ offers "Restart now" when any are pending.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from . import fill, looks
+from .paths import data_dir
 
-DEFAULT_PATH = Path(os.environ.get("APPDATA", Path.home())) / "framegen" / "settings.json"
+DEFAULT_PATH = data_dir() / "settings.json"  # %APPDATA%\\framegen on Windows (framegen/paths.py)
 
 
 @dataclass(frozen=True)

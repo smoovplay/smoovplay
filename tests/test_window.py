@@ -492,6 +492,7 @@ def test_to_bgr_scales_on_the_gpu_or_cpu():
     assert to_bgr(bgra, 1280, 720).shape == (720, 1280, 3)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="window capture is Windows-only")
 def test_open_window_scales_to_the_streams_size(monkeypatch):
     _Desk(monkeypatch)
     monkeypatch.setattr(window, "find_windows", lambda left_out=None: list(WINDOWS))

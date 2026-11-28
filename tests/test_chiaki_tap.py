@@ -51,6 +51,19 @@ def test_new_session_and_idr_flag(tap):
     assert tap.header().session == s + 1 and tap.header().write_seq == 0
 
 
+def test_a_writer_can_wait_until_the_reader_has_its_last_frame(tap):
+    """FrameTap.wait_read, for the fake PS5: it ends its stream only once the reader has taken the last frame, since
+    the reader stops at a dead header with whatever it hasn't read still in the ring. The reader writes its
+    heartbeat while it waits for the next frame, so one newer than the last push means it has read everything."""
+    tap.begin(0, 128, 96, 60)
+    tap.push(b"first" * 10)
+    assert tap.wait_read(0.05) is False  # no reader has caught up
+    tap.heartbeat()  # the reader, finding nothing new after the last frame
+    assert tap.wait_read(0.05) is True
+    tap.push(b"second" * 10)
+    assert tap.wait_read(0.05) is False  # a frame since that heartbeat
+
+
 def test_keyframes():
     assert is_keyframe(b"\x00\x00\x00\x01\x67sps\x00\x00\x01\x68pps\x00\x00\x01\x65idr", "h264")
     assert not is_keyframe(b"\x00\x00\x01\x41p-slice", "h264")

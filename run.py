@@ -106,9 +106,10 @@ def _mmss(seconds: float) -> str:
 
 
 def gpu_name() -> str:
-    """The graphics card doing the work: CUDA's, or (without it) the one DirectML picks."""
-    if torch.cuda.is_available():
-        return torch.cuda.get_device_name(0)
+    """The graphics card doing the work: CUDA's, a Mac's chip, or (without either) the one DirectML picks."""
+    from framegen import gpu
+    if torch.cuda.is_available() or gpu.MAC:
+        return gpu.name()
     try:
         from framegen.dml import pick_adapter
         return pick_adapter()["name"]
@@ -180,11 +181,23 @@ def write_stream_check(src, results: str | None) -> None:
         print(f"[results] couldn't write {path}: {e}")
 
 
+MAC_CAPTURE = sys.platform == "darwin"  # capture cards through OpenCV's AVFoundation input (open_capture)
+
+
 def open_capture(a, w: int, h: int, test):
-    """--capture: a card by name or number (framegen.capture), or a file standing in for one."""
+    """--capture: a card by name or number (framegen.capture), or a file standing in for one. On a Mac a card is
+    read by number through OpenCV's AVFoundation input, because framegen.capture reads cards with DirectShow, which
+    only Windows has. Not yet tested with a real card on a Mac."""
+    if MAC_CAPTURE and a.capture_backend == "pyav" and not Path(a.capture).is_file():
+        if not a.capture.isdigit():
+            sys.exit("[capture] on a Mac, give the capture card by number (0 is usually the first camera or card). "
+                     "ffmpeg -f avfoundation -list_devices true -i \"\" lists them")
+        print("[capture] on a Mac, capture cards are read through OpenCV's AVFoundation input (Experimental)")
+        a.capture_backend = "opencv"
     if a.capture_backend == "opencv":
         device = int(a.capture) if a.capture.isdigit() else a.capture
-        return CaptureSource(device, w, h, fourcc=a.capture_fourcc, test=test)
+        backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_DSHOW
+        return CaptureSource(device, w, h, fourcc=a.capture_fourcc, test=test, backend=backend)
     from framegen import capture
     colour = {"auto": "auto", "709-limited": (True, False), "709-full": (True, True), "601-limited": (False, False),
               "601-full": (False, True)}[a.capture_colour]
@@ -303,9 +316,11 @@ def main() -> int:
     ap.add_argument("--capture-fourcc", default="MJPG", help="[opencv backend] MJPG, YUY2 or NV12")
     ap.add_argument("--list-devices", action="store_true", help="list capture devices and exit")
     ap.add_argument("--chiaki", action="store_true", help="PS5 Remote Play frames from chiaki-ng's frame tap")
-    ap.add_argument("--chiaki-decoder", default="cuda", choices=["cuda", "sw", "d3d11va"],
+    mac = sys.platform == "darwin"
+    ap.add_argument("--chiaki-decoder", default="cuda", choices=["cuda", "sw", "d3d11va"] + ["videotoolbox"] * mac,
                     help="how to decode the Remote Play stream (default cuda: NVDEC, frames stay on the GPU, ~1.5 ms "
-                         "a frame; sw takes ~10 ms a frame on gameplay)")
+                         "a frame; sw takes ~10 ms a frame on gameplay)"
+                         + (". On a Mac, videotoolbox, which cuda and d3d11va also mean there" if mac else ""))
     ap.add_argument("--chiaki-log", metavar="CSV", help="write one row per tick: stream facts and pipeline decisions")
     ap.add_argument("--minimize-chiaki", action=argparse.BooleanOptionalAction, default=None,
                     help="minimise chiaki-ng's window while ours is up (it keeps streaming but stops drawing video "
@@ -386,7 +401,17 @@ def main() -> int:
         return capture_main(["--list"] + (["--json"] if a.json else []))
     # Without NVIDIA's CUDA (an AMD or Intel card), RIFE runs through DirectML (framegen/dml.py, Experimental): frames
     # stay on the CPU between steps, and Remote Play is decoded with Direct3D 11 instead of NVDEC.
-    dml_mode = not torch.cuda.is_available()
+    # On a Mac, RIFE runs through PyTorch on Apple's GPU (Metal, framegen/gpu.py and metalrife.py) and Remote Play is
+    # decoded with VideoToolbox. Nothing of NVIDIA's (TensorRT, NVIDIA VFG, RTX VSR) or DirectML's is there.
+    from framegen import gpu
+    mac_mode = gpu.MAC and not torch.cuda.is_available()
+    dml_mode = not torch.cuda.is_available() and not mac_mode
+    if mac_mode:
+        where = ("Apple's GPU (Metal)" if gpu.device() == "mps" else
+                 "the CPU (Metal isn't available, so this will be slow)")
+        print(f"[run] RIFE runs through PyTorch on {where}, {gpu.name()}")
+        if a.chiaki_decoder in ("cuda", "d3d11va"):
+            a.chiaki_decoder = "videotoolbox"
     if dml_mode:
         from framegen import dml
         why = dml.unavailable_reason()
@@ -417,8 +442,14 @@ def main() -> int:
             test = None
     elif kind == "chiaki":
         from framegen.chiaki_tap import NAME, ChiakiSource
-        src = ChiakiSource(a.chiaki_decoder, wait_s=600, log_path=a.chiaki_log or frame_log(a.results),
-                           tap_name=a.chiaki_tap or NAME, test=test)
+        try:
+            src = ChiakiSource(a.chiaki_decoder, wait_s=600, log_path=a.chiaki_log or frame_log(a.results),
+                               tap_name=a.chiaki_tap or NAME, test=test)
+        except ValueError as e:  # off Windows, a tap name too long for shared memory there (framegen/tapsys.py)
+            if sys.platform == "win32":
+                raise
+            print(f"[chiaki] {e}", file=sys.stderr)
+            return 1
     elif kind == "capture":
         if a.capture is None:
             ap.error("--source capture needs --capture N (a device) or --capture FILE")
@@ -481,6 +512,10 @@ def main() -> int:
     if kind == "chiaki" and settings.hdr != "off" and getattr(src, "hdr_stream", False):
         if dml_mode:
             hdr_why = "SmoovPlay's HDR needs an NVIDIA card for now"
+        elif mac_mode:
+            hdr_out = "sdr8"  # HDR output goes through a DXGI swap chain, which only Windows has
+            if settings.hdr == "hdr10":
+                print("[run] HDR output isn't on a Mac yet, so HDR is shown in SDR")
         else:
             hdr_out = "sdr8"
             if settings.hdr == "hdr10":
@@ -512,9 +547,13 @@ def main() -> int:
 
     # Auto motion detail also goes by Auto-detect's last time at full detail on this graphics card: where that doesn't
     # fit a frame (an RTX 20 card at 60 fps), Auto is half
-    from framegen.autodetect import LAPTOP_SHARE, SHARE, auto_scale, saved_full_ms
+    from framegen.autodetect import LAPTOP_SHARE, MAC_PRESENT_MS, SHARE, auto_scale, saved_full_ms
     card = gpu_name()
-    card_full_ms = None if a.settings.lower() == "none" else saved_full_ms(Path(a.settings), card)
+    # On a Mac another core can share the file with its own engine, so only this pipeline's times count there
+    card_full_ms = None if a.settings.lower() == "none" else saved_full_ms(Path(a.settings), card,
+                                                                           engine="torch" if mac_mode else None)
+    if mac_mode and card_full_ms is not None:  # each frame shown also goes through the CPU to OpenGL there
+        card_full_ms += MAC_PRESENT_MS
     card_share = LAPTOP_SHARE if "laptop" in card.lower() else SHARE
     if (a.scale is None and settings.motion == "auto" and card_full_ms is not None
             and auto_scale(src.w, src.h, settings.hz, card_full_ms, card_share) < auto_scale(src.w, src.h, settings.hz)):
@@ -523,7 +562,7 @@ def main() -> int:
 
     def session_config() -> dict:
         """What a session is built from; a restart is needed when this changes (keys: settings.SPECS)."""
-        if (test_model or settings.model) == "vfg" and not dml_mode:
+        if (test_model or settings.model) == "vfg" and not dml_mode and not mac_mode:
             return {"model": "vfg", "vfg_quality": settings.vfg_quality}
         if a.scale is not None:
             scale = a.scale
@@ -536,7 +575,7 @@ def main() -> int:
         engine = auto_engine(scale) if settings.engine == "auto" else settings.engine
         if dml_mode:
             engine = "dml"
-        elif not has_trt:
+        elif mac_mode or not has_trt:
             engine = "torch"
         model = test_model or settings.model
         return {"engine": engine, "motion": scale, "model": BY_KEY["model"].default if model == "vfg" else model}
@@ -579,14 +618,15 @@ def main() -> int:
             return f"NVIDIA VFG quality={cfg['vfg_quality']}"
         if cfg["engine"] == "dml":
             return f"RIFE {cfg['model']} scale={cfg['motion']}  DirectML"
+        engine = "TensorRT" if cfg["engine"] == "trt" else "PyTorch + Metal kernels" if mac_mode else "PyTorch"
         return (f"RIFE {cfg['model']} scale={cfg['motion']} {'fp32' if a.fp32 else 'fp16'} "
-                f"graphs={'off' if a.no_graph else 'on'}  {'TensorRT' if cfg['engine'] == 'trt' else 'PyTorch'}")
+                f"graphs={'off' if a.no_graph or mac_mode else 'on'}  {engine}")
 
     def label_of(cfg: dict) -> str:  # the overlay's first words
         hdr_tag = {"sdr8": "  HDR in SDR", "pq16": "  HDR10"}.get(hdr_out, "")
         if cfg["model"] == "vfg":
             return f"VFG {cfg['vfg_quality']}{hdr_tag}"
-        engine = {"trt": " TRT", "dml": " DML"}.get(cfg["engine"], "")
+        engine = {"trt": " TRT", "dml": " DML"}.get(cfg["engine"], " Metal" if mac_mode else "")
         return f"RIFE {cfg['model']}{engine}{' half' if cfg['motion'] < 1 else ''}{hdr_tag}"
 
     window = None
@@ -620,6 +660,11 @@ def main() -> int:
         unavailable["hdr"] = "Only used with PS5 Remote Play."
     elif dml_mode:
         unavailable["hdr"] = "Not without an NVIDIA card yet."
+    if mac_mode:
+        unavailable["engine"] = "On a Mac, RIFE runs through PyTorch on Apple's GPU (Metal)."
+        unavailable["model"] = "NVIDIA VFG needs an NVIDIA RTX card."
+        unavailable["present"] = "On a Mac, the window always presents through OpenGL."
+        unavailable["minimize_chiaki"] = "Not on a Mac yet: chiaki-ng's window stays where it is."
     hdr10_rows = {k: "Not with HDR output yet." for k in ("look_on", "look", "look_clips")}
     hdr10_rows["present"] = "HDR output always uses the low-delay presentation."
     if hdr10[0]:
@@ -654,7 +699,7 @@ def main() -> int:
             unavailable["present"] = window.unavailable["present"]
         interp = None
         gc.collect()
-        torch.cuda.empty_cache()
+        gpu.empty_cache()
         cfg, interp = build_or_rife(session_config())  # with 8-bit frames
     if kind == "chiaki" and hasattr(src, "set_hdr"):
         src.set_hdr(hdr_out, hdr_peak if hdr10[0] else None, why=hdr_why)
@@ -670,8 +715,8 @@ def main() -> int:
     hidden: list[int] = []
 
     def minimize_chiaki(key: str = "minimize_chiaki") -> None:
-        if key != "minimize_chiaki" or not (picked == "chiaki" and window is not None):
-            return
+        if key != "minimize_chiaki" or not (picked == "chiaki" and window is not None) or mac_mode:
+            return  # (greyed out on a Mac, above)
         from framegen.winutil import SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, show, windows_of
         if settings.minimize_chiaki and not hidden:
             hidden[:] = windows_of("chiaki.exe")
@@ -803,7 +848,8 @@ def main() -> int:
     ticks = iter(src)  # one stream for every session, so a restart doesn't reconnect or reopen anything
     if sink.sinks:  # playing on screen: keep frames on time when other programs are busy
         from framegen.winutil import boost_gpu, boost_thread, keep_screen_on
-        print(f"[run] scheduling: MMCSS {'on' if boost_thread() else 'off'}, "
+        print(f"[run] scheduling: {'QoS user-interactive' if mac_mode else 'MMCSS'} "
+              f"{'on' if boost_thread() else 'off'}, "
               f"GPU priority {'high' if boost_gpu() else 'normal'}, "
               f"screen kept on {'yes' if keep_screen_on() else 'no'}")  # (a controller isn't input to Windows)
     try:
@@ -834,7 +880,7 @@ def main() -> int:
             close_interp(interp)
             interp = None
             gc.collect()
-            torch.cuda.empty_cache()
+            gpu.empty_cache()
             cfg = session_config()
             print(f"[run] restarting for {reasons}: {describe(cfg)}")
             try:

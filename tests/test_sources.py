@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from fractions import Fraction
 from pathlib import Path
 
 import cv2
@@ -117,7 +118,8 @@ def test_a_file_standing_in_for_a_capture_card_matches_the_file_path(clip60):
 
 
 # ----------------------------------------------------------------------------- Remote Play through a fake PS5
-@pytest.mark.skipif(sys.platform != "win32", reason="the frame tap is Windows-only")
+@pytest.mark.skipif(sys.platform not in ("win32", "darwin") and not sys.platform.startswith("linux"),
+                    reason="the frame tap is Windows, Linux and macOS only")
 @pytest.mark.parametrize("native", [True, False])
 def test_remote_play_through_a_fake_ps5(clip60, native):
     """chiaki path end to end on the CPU (libx264 + software decoding): a 60 fps game in test mode, or a 30 fps
@@ -143,6 +145,9 @@ def test_remote_play_through_a_fake_ps5(clip60, native):
         src.close()
     finally:
         out = fake.communicate(timeout=30)[0].decode(errors="replace")
+        from framegen.chiaki_tap import AUDIO_SUFFIX
+        from framegen.tapsys import unlink
+        unlink(tap, tap + AUDIO_SUFFIX)  # shared memory on Linux and macOS outlives both processes
     assert len(ticks) >= 20, out
     assert [t.index for t in ticks] == list(range(len(ticks)))
     for t in ticks:
@@ -158,6 +163,55 @@ def test_remote_play_through_a_fake_ps5(clip60, native):
         hints = [t.extra["size_new"] for t in ticks[8:]]  # the size check, once it has seen a few frames
         alternating = sum(h == (i % 2 == 0) for i, h in enumerate(hints))
         assert max(alternating, len(hints) - alternating) >= 0.9 * len(hints), hints
+
+
+def _videotoolbox_decodes() -> bool:
+    """Whether VideoToolbox decodes H.264 here. A virtual Mac, like a CI runner, may have no media engine."""
+    import av
+    from av.codec.hwaccel import HWAccel
+    try:
+        enc = av.CodecContext.create("libx264", "w")
+        enc.width, enc.height, enc.pix_fmt, enc.time_base = W, H, "yuv420p", Fraction(1, 60)
+        enc.open()
+        frame = av.VideoFrame.from_ndarray(np.zeros((H, W, 3), np.uint8), format="bgr24").reformat(format="yuv420p")
+        packets = list(enc.encode(frame)) + list(enc.encode(None))
+        dec = av.CodecContext.create("h264", "r", hwaccel=HWAccel("videotoolbox"))
+        return any(f.format.name == "nv12" for p in packets + [None] for f in dec.decode(p))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="VideoToolbox is a Mac's hardware decoder")
+def test_remote_play_on_a_mac_decodes_with_videotoolbox(clip60, capsys):
+    """run.py's default decoder, cuda (NVDEC), means VideoToolbox on a Mac, and gives the pictures software
+    decoding does."""
+    from framegen.chiaki_tap import AUDIO_SUFFIX, ChiakiSource
+    from framegen.tapsys import unlink
+    if not _videotoolbox_decodes():
+        pytest.skip("VideoToolbox doesn't decode on this Mac")
+
+    def play(decoder: str) -> list:
+        tap = f"Local\\sp-test-vt-{os.getpid()}"
+        fake = subprocess.Popen([sys.executable, str(ROOT / "scripts" / "frametap_fake.py"), str(clip60), "--sw",
+                                 "--seconds", "5", "--delay", "0.3", "--tap", tap, "--mbps", "2", "--native"],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            src = ChiakiSource(decoder, wait_s=20, tap_name=tap, test=TestMode(True))
+            ticks = [t for t in src if not isinstance(t, Waiting)]
+            src.close()
+        finally:
+            out = fake.communicate(timeout=30)[0].decode(errors="replace")
+            unlink(tap, tap + AUDIO_SUFFIX)
+        assert len(ticks) >= 20, out
+        return [t.frame for t in ticks if t.truth_new], src.decoder_kind
+
+    sw, _ = play("sw")
+    capsys.readouterr()
+    vt, kind = play("cuda")
+    assert kind == "videotoolbox" and "[chiaki] decoding with VideoToolbox" in capsys.readouterr().out
+    assert len(vt) == len(sw)
+    for a, b in zip(vt, sw):
+        assert a.shape == (H, W, 3) and np.abs(a.astype(int) - b).max() <= 2
 
 
 # ----------------------------------------------------------------------------- 60 Hz clock

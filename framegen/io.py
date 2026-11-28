@@ -285,9 +285,16 @@ def _is_cuda(frame) -> bool:
     return getattr(frame, "is_cuda", False)
 
 
+def _on_gpu(frame) -> bool:
+    """A torch tensor on any GPU (CUDA, or Apple's "mps"), which numpy can't read until it's copied over."""
+    dev = getattr(frame, "device", None)
+    return dev is not None and getattr(dev, "type", "cpu") != "cpu"
+
+
 def _host(frame) -> np.ndarray:
-    """A frame as a numpy array (CUDA tensors are copied to the CPU)."""
-    return frame.cpu().numpy() if _is_cuda(frame) else frame
+    """A frame as a numpy array (GPU tensors are copied to the CPU). On a Mac the HDR converter leaves frames on
+    Apple's GPU, so this can't be CUDA-only: numpy raised on the first HDR frame."""
+    return frame.cpu().numpy() if _on_gpu(frame) else frame
 
 
 # Low delay (DXGI) is for windowed play. Fullscreen already skips the compositor's copy with the standard presentation,

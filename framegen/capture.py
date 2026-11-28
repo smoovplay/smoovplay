@@ -234,7 +234,10 @@ def dshow_names() -> list[Device]:
 def list_devices() -> list[Device]:
     """The capture devices Windows has, by name (dshow_names), or from FFmpeg's own listing if DirectShow's list
     can't be read that way. An empty video list is looked at once more after half a second: a card can be missing
-    for a moment while its driver starts, or while another app lets it go."""
+    for a moment while its driver starts, or while another app lets it go. On a Mac, AVFoundation's devices
+    (avfoundation_devices)."""
+    if sys.platform == "darwin":
+        return avfoundation_devices()
     devices: list[Device] = []
     for attempt in range(2):
         if attempt:
@@ -245,6 +248,36 @@ def list_devices() -> list[Device]:
             devices = parse_devices(_dshow_log("dummy", {"list_devices": "true"}))
         if any(d.kind == "video" for d in devices):
             break
+    return devices
+
+
+def avfoundation_devices() -> list[Device]:
+    """A Mac's cameras, capture cards and microphones, from FFmpeg's AVFoundation listing. Each one's alt is its index
+    there, which is what a Mac opens a card by. Screens ("Capture screen N") are left out."""
+    import av
+    import av.logging
+    old = av.logging.get_level()
+    av.logging.set_level(av.logging.INFO)
+    try:
+        with av.logging.Capture() as logs:
+            try:
+                av.open("", format="avfoundation", options={"list_devices": "true"}).close()
+            except Exception:  # noqa: BLE001 - a listing always raises once FFmpeg has printed it
+                pass
+    finally:
+        av.logging.set_level(old)
+    return parse_avfoundation("".join(msg for _, name, msg in logs if name.startswith("AVFoundation")))
+
+
+def parse_avfoundation(text: str) -> list[Device]:
+    devices, kind = [], "unknown"
+    for line in text.splitlines():
+        if "video devices" in line:
+            kind = "video"
+        elif "audio devices" in line:
+            kind = "audio"
+        elif (m := re.match(r"\s*\[(\d+)\]\s+(.+?)\s*$", line)) and not m.group(2).startswith("Capture screen"):
+            devices.append(Device(m.group(2), kind, m.group(1)))
     return devices
 
 

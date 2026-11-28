@@ -39,10 +39,12 @@ import av
 import numpy as np
 from av.video.frame import PictureType
 
+from .paths import data_dir
+
 ROOT = Path(__file__).resolve().parents[1]
 # A before & after video being made keeps a file here named after its process id, holding the video's path, so the
 # launcher knows. It carries on after the video window and the launcher close; updating SmoovPlay would stop it.
-SAVING_DIR = Path(os.environ.get("APPDATA", Path.home())) / "framegen" / "saving"
+SAVING_DIR = data_dir() / "saving"
 TB = 90000  # MPEG-TS clock: every timestamp here is in 1/90000 s
 OFFSET = 10 * TB  # timestamps start 10 s in, so none is ever negative
 LENGTHS = (0, 30, 60, 120, 300)  # settings.replay's choices, in seconds (0: off)
@@ -67,6 +69,10 @@ ENCODERS = {
     "h264_qsv": {"preset": "veryfast", "forced_idr": "1", "bf": "0", "async_depth": "1"},
     "libx264": {"preset": "superfast", "tune": "zerolatency", "forced-idr": "1", "crf": "21"},
 }
+if sys.platform == "darwin":
+    # A Mac's media engine, first since none of the others are there. It hands back its first packets a few frames
+    # late, which the ring doesn't mind, since each packet keeps its own time.
+    ENCODERS = {"h264_videotoolbox": {"realtime": "1", "prio_speed": "1", "allow_sw": "0", "bf": "0"}, **ENCODERS}
 _works: dict[str, bool] = {}
 
 
@@ -277,10 +283,11 @@ def _cut(ring: list, start: int, end: int, at_key: bool = True) -> list:
 
 # ---- saving ---------------------------------------------------------------------------------------------------
 def videos_folder() -> Path:
-    """Where clips go: SMOOVPLAY_REPLAY_DIR if set, else Videos\\SmoovPlay (wherever Windows keeps Videos)."""
+    """Where clips go: SMOOVPLAY_REPLAY_DIR if set, else Videos\\SmoovPlay (wherever Windows keeps Videos), or on a
+    Mac Movies/SmoovPlay."""
     if os.environ.get("SMOOVPLAY_REPLAY_DIR"):
         return Path(os.environ["SMOOVPLAY_REPLAY_DIR"])
-    base = Path.home() / "Videos"
+    base = Path.home() / ("Movies" if sys.platform == "darwin" else "Videos")
     if sys.platform == "win32":
         try:
             import uuid
@@ -926,6 +933,11 @@ class Recorder:
             proc = subprocess.Popen(cmd, cwd=ROOT, creationflags=flags, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                                     errors="replace")
+            if sys.platform != "win32":  # the same below-normal priority, as nice 10
+                try:
+                    os.setpriority(os.PRIO_PROCESS, proc.pid, 10)
+                except OSError:
+                    pass
             with self._lock:
                 self._making = [p for p in self._making if p.poll() is None] + [proc]
             print(f"[replay] before & after of {secs:.1f} s: being made in the background (process {proc.pid})")

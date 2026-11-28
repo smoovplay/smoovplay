@@ -81,3 +81,64 @@ Core ML notes:
   or whether it becomes a Pro/Max option with 720p as the default. Results from those chips are welcome.
 - **A long session** (10+ minutes): temperature, clocks and memory under a steady load.
 - **End-to-end latency** of the whole chain, once frame pacing uses `framegen/cadence.py`.
+
+## Playing on a Mac
+
+`run.py` also plays on an Apple silicon Mac (Experimental). RIFE runs on Apple's GPU through PyTorch's Metal
+backend, PS5 Remote Play is decoded with VideoToolbox, and the window draws with OpenGL 4.1. It needs Python 3.12.
+Any 60 fps recording works for a first try.
+
+```sh
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt   # PyPI's torch runs on Apple's GPU as it is
+.venv/bin/python -m framegen.prepare                  # downloads RIFE's weights and picks settings for this Mac
+.venv/bin/python run.py testdata/clip_1080p60.mp4 --realtime --display
+```
+
+For PS5 Remote Play, chiaki-ng needs the frame tap patched in. `chiaki_tap/build_macos.sh` builds it with Homebrew,
+and `run_chiaki_frametap.command` starts it with the tap on. That script and its README section come in a separate
+pull request, the macOS chiaki-ng build. With chiaki-ng streaming, start the player.
+
+```sh
+.venv/bin/python run.py --chiaki --display
+```
+
+`scripts/frametap_fake.py` stands in for a PS5 when there's no console, as on Windows. On a Mac a tap name can have at
+most 24 characters after `Local\`, because macOS allows 31 for a shared-memory name and the sound ring adds `-audio`.
+
+### What's different on a Mac
+
+- RIFE runs through `framegen/metalrife.py`, whose Metal kernels do everything but the convolutions. A 1080p
+  in-between frame takes 6.8 ms at full motion detail on an M5 Max and 4.4 ms at half. `SMOOVPLAY_METAL=0` runs
+  plain PyTorch instead.
+- VideoToolbox decodes a 1080p HEVC frame in about 2 ms, colour conversion included. If it can't take a stream,
+  FFmpeg decodes it in software and the log says so. `--chiaki-decoder cuda` and `d3d11va` mean VideoToolbox here.
+- The frame tap is POSIX shared memory, with the same layout as on Windows.
+- Frames reach the window through the CPU, whose memory the GPU shares. That costs about 3 ms a frame, which Auto
+  motion detail and Auto-detect count. FSR 1, Looks and Fill the screen work. Fullscreen covers the menu bar and the
+  Dock.
+- An HDR stream is tone-mapped on Apple's GPU and shown in SDR.
+- Instant replay encodes with VideoToolbox and saves to `~/Movies/SmoovPlay`. Settings, looks and Auto-detect's
+  times are kept in `~/Library/Application Support/framegen`.
+- While the video plays, `caffeinate` keeps the screen on. The decoder and video threads run as user-interactive
+  work, which macOS keeps on its performance cores.
+
+### Not done yet
+
+- TensorRT, NVIDIA VFG and RTX VSR are NVIDIA's, so their rows are greyed out in the menu.
+- HDR output, which goes through DXGI on Windows.
+- Window capture, keys that work while another app is in front, and minimising chiaki-ng's window. "Minimise
+  chiaki-ng" is greyed out.
+- Capture cards are read by number through OpenCV's AVFoundation input (`--capture 0`). None has been tried yet.
+- There's no launcher or installer, so it runs from the command line.
+
+### Numbers
+
+On an M5 Max, with the fake PS5 sending a 1080p HEVC stream of a 60 fps game in test mode
+(`frametap_fake.py --native --chiaki-like`), at 60 fps and full motion detail an interpolation tick takes 11.8 ms
+at p50. Each real frame is on screen 29 ms after it reaches the tap. At 90 fps, 73% of the extra frames are shown on
+time at half detail and 72% at full, and the rest fall back to 60 fps. A real frame then takes about 42 ms from the
+tap to the screen.
+
+With a real PS5 playing a 30 fps game at 90 fps and full detail for about four minutes, 67% of the extra frames were
+on time. A frame took 42.5 ms from the stream to the screen at p50, and 49.7 ms at p95.

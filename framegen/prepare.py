@@ -28,6 +28,8 @@ def main() -> int:
 
     print("[prepare] checking the graphics card", flush=True)
     import torch
+    if sys.platform == "darwin" and not torch.cuda.is_available():
+        return prepare_mac(a)
     if not torch.cuda.is_available():
         return prepare_dml(a)
     name = torch.cuda.get_device_name(0)
@@ -43,6 +45,26 @@ def main() -> int:
         build_engines(a)
     else:
         print("[prepare] TensorRT isn't available, so the PyTorch engine will be used (about 12% slower)", flush=True)
+    if not a.no_detect:
+        pick_settings()
+    print("[prepare] done", flush=True)
+    return 0
+
+
+def prepare_mac(a: argparse.Namespace) -> int:
+    """On a Mac, RIFE runs through PyTorch on Apple's GPU (Metal, framegen/gpu.py), so there's nothing to build
+    ahead."""
+    import torch
+
+    from . import gpu
+    if gpu.device() != "mps":
+        print("[prepare] ERROR: PyTorch can't use this Mac's GPU (Metal). SmoovPlay needs an Apple silicon Mac",
+              flush=True)
+        return 2
+    print(f"[prepare] {gpu.name()}: RIFE runs through PyTorch {torch.__version__} on Apple's GPU (Metal)", flush=True)
+    from .interpolator import ensure_weights
+    ensure_weights(a.model)
+    print(f"[prepare] RIFE {a.model} weights ready", flush=True)
     if not a.no_detect:
         pick_settings()
     print("[prepare] done", flush=True)
