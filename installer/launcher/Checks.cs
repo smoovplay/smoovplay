@@ -387,6 +387,54 @@ namespace SmoovPlay
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplayDevices(string dev, int i, ref DISPLAY_DEVICE dd, int flags);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplaySettings(string dev, int mode, ref DEVMODE dm);
 
+        static string MonitorId(string device)
+        {
+            var mon = new DISPLAY_DEVICE { cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE)) };
+            if (EnumDisplayDevices(device, 0, ref mon, 1) && !string.IsNullOrEmpty(mon.DeviceID))  // EDD_GET_DEVICE_INTERFACE_NAME
+            {
+                var parts = mon.DeviceID.Split(new[] { '#' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 3)
+                {
+                    string pnp = Regex.Replace(parts[1], @"[^A-Za-z0-9_-]", "");
+                    var tokens = parts[2].Split(new[] { '&' }, StringSplitOptions.RemoveEmptyEntries);
+                    string tail = tokens.Length > 0 ? Regex.Replace(tokens[tokens.Length - 1], @"[^A-Za-z0-9_-]", "") : "";
+                    if (pnp.Length > 0 && tail.Length > 0) return pnp + "-" + tail;
+                }
+            }
+            string shortDev = device.StartsWith(@"\\.\") ? device.Substring(4) : device;
+            string clean = Regex.Replace(shortDev, @"[^A-Za-z0-9_-]", "");
+            return clean.Length > 0 ? clean : "DISPLAY";
+        }
+
+        static bool MatchesMonitor(string device, string want)
+        {
+            if (string.IsNullOrEmpty(want)) return false;
+            string shortDev = Regex.Replace(device.StartsWith(@"\\.\") ? device.Substring(4) : device, @"[^A-Za-z0-9_-]", "");
+            string id = MonitorId(device);
+            return string.Equals(id, want, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(id + "-" + shortDev, want, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(device, want, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(shortDev, want, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>The shape of the chosen display (width over height, as set now), or WidestScreenRatio() if none
+        /// matches: the Settings page draws Fill the screen on it.</summary>
+        public static double ScreenRatio(string monitor)
+        {
+            bool wantPrimary = string.IsNullOrEmpty(monitor) || string.Equals(monitor, "primary", StringComparison.OrdinalIgnoreCase);
+            var dd = new DISPLAY_DEVICE { cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE)) };
+            for (int i = 0; EnumDisplayDevices(null, i, ref dd, 0); i++, dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE)))
+            {
+                if ((dd.StateFlags & 1) == 0) continue;  // DISPLAY_DEVICE_ATTACHED_TO_DESKTOP
+                bool match = wantPrimary ? (dd.StateFlags & 4) != 0 : MatchesMonitor(dd.DeviceName, monitor);
+                if (!match) continue;
+                var dm = new DEVMODE { dmSize = (short)Marshal.SizeOf(typeof(DEVMODE)) };
+                if (EnumDisplaySettings(dd.DeviceName, -1, ref dm) && dm.dmPelsHeight > 0)
+                    return (double)dm.dmPelsWidth / dm.dmPelsHeight;
+            }
+            return WidestScreenRatio();
+        }
+
         /// <summary>The widest shape among the connected displays (width over height, as set now), or 16:9 when none
         /// can be read: the Settings page draws Fill the screen on it.</summary>
         public static double WidestScreenRatio()
@@ -403,25 +451,49 @@ namespace SmoovPlay
             return best > 0 ? best : 16.0 / 9.0;
         }
 
-        /// <summary>The fastest refresh rate a connected display is set to, and the fastest it could be set to.</summary>
+        static void DisplayMode(string device, out int now, out int w, out int h, out int possible)
+        {
+            now = w = h = possible = 0;
+            var dm = new DEVMODE { dmSize = (short)Marshal.SizeOf(typeof(DEVMODE)) };
+            if (!EnumDisplaySettings(device, -1, ref dm)) return;  // ENUM_CURRENT_SETTINGS
+            now = dm.dmDisplayFrequency; w = dm.dmPelsWidth; h = dm.dmPelsHeight; possible = now;
+            for (int m = 0; ; m++)
+            {
+                var mode = new DEVMODE { dmSize = (short)Marshal.SizeOf(typeof(DEVMODE)) };
+                if (!EnumDisplaySettings(device, m, ref mode)) break;
+                if (mode.dmPelsWidth == w && mode.dmPelsHeight == h) possible = Math.Max(possible, mode.dmDisplayFrequency);
+            }
+        }
+
+        /// <summary>The chosen display's refresh rate (or the fastest connected display's), and the fastest it could be set to.</summary>
         static void Display(Check c)
         {
-            int bestNow = 0, bestPossible = 0, wNow = 0, hNow = 0;
+            string want = Prefs.Setting("monitor");
+            bool pickSpecific = !string.IsNullOrEmpty(want) && !string.Equals(want, "primary", StringComparison.OrdinalIgnoreCase);
+            var devices = new List<string>();
+            string chosen = null;
             var dd = new DISPLAY_DEVICE { cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE)) };
             for (int i = 0; EnumDisplayDevices(null, i, ref dd, 0); i++, dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE)))
             {
                 if ((dd.StateFlags & 1) == 0) continue;  // DISPLAY_DEVICE_ATTACHED_TO_DESKTOP
-                var dm = new DEVMODE { dmSize = (short)Marshal.SizeOf(typeof(DEVMODE)) };
-                if (!EnumDisplaySettings(dd.DeviceName, -1, ref dm)) continue;  // ENUM_CURRENT_SETTINGS
-                int now = dm.dmDisplayFrequency, w = dm.dmPelsWidth, h = dm.dmPelsHeight, possible = now;
-                for (int m = 0; ; m++)
+                devices.Add(dd.DeviceName);
+                if (pickSpecific && chosen == null && MatchesMonitor(dd.DeviceName, want))
+                    chosen = dd.DeviceName;
+            }
+            int bestNow = 0, bestPossible = 0, wNow = 0, hNow = 0;
+            if (chosen != null)
+            {
+                DisplayMode(chosen, out bestNow, out wNow, out hNow, out bestPossible);
+            }
+            else
+            {
+                foreach (var dev in devices)
                 {
-                    var mode = new DEVMODE { dmSize = (short)Marshal.SizeOf(typeof(DEVMODE)) };
-                    if (!EnumDisplaySettings(dd.DeviceName, m, ref mode)) break;
-                    if (mode.dmPelsWidth == w && mode.dmPelsHeight == h) possible = Math.Max(possible, mode.dmDisplayFrequency);
+                    int now, w, h, possible;
+                    DisplayMode(dev, out now, out w, out h, out possible);
+                    if (now > bestNow) { bestNow = now; wNow = w; hNow = h; }
+                    bestPossible = Math.Max(bestPossible, possible);
                 }
-                if (now > bestNow) { bestNow = now; wNow = w; hNow = h; }
-                bestPossible = Math.Max(bestPossible, possible);
             }
             if (bestNow == 0) { c.Set(Level.Info, "Unknown", ""); return; }
             string value = $"{wNow}×{hNow} at {bestNow} Hz";

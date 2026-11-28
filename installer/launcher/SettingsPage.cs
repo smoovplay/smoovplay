@@ -58,6 +58,7 @@ namespace SmoovPlay
 
             public bool AppliesTo(Func<string, object> value)
             {
+                if (Choices.Count <= 1) return false;
                 return AppliesKey == null || AppliesValues.Any(a => Same(a, value(AppliesKey)));
             }
 
@@ -292,6 +293,7 @@ namespace SmoovPlay
             }
             LayoutSections(true);
             RefreshSettings();
+            BuildChips();
             if (page == "PageSettings") SnapLater("settings-built", 600);
         }
 
@@ -439,21 +441,22 @@ namespace SmoovPlay
             }
             if (!spec.Live)
             {
+                bool nextPlay = spec.Key == "present" || spec.Key == "monitor";
                 row.RestartTag = new Border
                 {
                     CornerRadius = new CornerRadius(8), BorderBrush = R("Line2"), BorderThickness = new Thickness(1), Padding = new Thickness(7, 1, 7, 2),
                     Margin = new Thickness(10, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center, Visibility = Visibility.Collapsed,
-                    // Window presentation is read when the video window opens; Restart now only rebuilds the AI engine
-                    ToolTip = spec.Key == "present" ? "While playing, this one changes the next time you press Play."
-                                                    : "While playing, this one changes after a restart (Restart now, at the top).",
-                    Child = new TextBlock { Text = spec.Key == "present" ? "next Play" : "after a restart", FontSize = 10.5, Foreground = R("Muted") },
+                    // Window presentation and Monitor are read when the video window opens; Restart now only rebuilds the AI engine
+                    ToolTip = nextPlay ? "While playing, this one changes the next time you press Play."
+                                       : "While playing, this one changes after a restart (Restart now, at the top).",
+                    Child = new TextBlock { Text = nextPlay ? "next Play" : "after a restart", FontSize = 10.5, Foreground = R("Muted") },
                 };
                 title.Children.Add(row.RestartTag);
             }
             g.Children.Add(title);
 
             FrameworkElement control;
-            bool segs = off != null || (!spec.OnOff && spec.Choices.Count <= 4);
+            bool segs = off != null || (!spec.OnOff && spec.Choices.Count <= 4 && spec.Key != "monitor");
             if (spec.OnOff && off == null)
             {
                 var sw = new CheckBox { Style = S("Switch"), VerticalAlignment = VerticalAlignment.Center };
@@ -773,6 +776,7 @@ namespace SmoovPlay
             Show(E("SetRestart"), showRestart);
             UpdateDetect();
             RenderVfg();
+            UpdateFillPreview(valueOf("monitor") as string);
         }
 
         /// <summary>The line above each row: only between rows that are showing.</summary>
@@ -799,6 +803,7 @@ namespace SmoovPlay
             if (SessionRunning) { RefreshSettings(); return; }  // locked meanwhile
             try { WriteSetting(spec.Key, value); }
             catch (Exception e) { Toast("Couldn't save the setting: " + e.Message, true); }
+            if (spec.Key == "monitor") checks = null;
             RefreshSettings();
             BuildChips();
         }

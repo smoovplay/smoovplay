@@ -17,6 +17,8 @@ namespace SmoovPlay
     {
         Action<string> fillDraw;  // redraws the preview for a choice ("fit", "zoom", "stretch", "panorama")
         string fillPicked = "fit";
+        ContentControl fillHost;
+        string fillMonitor = "\0";
 
         const double FillH = 46;  // the screen's height in the drawing
         double FillPad = 9;  // room above and below it, for Zoom's cut-off parts (more on a wider screen)
@@ -24,7 +26,18 @@ namespace SmoovPlay
         /// <summary>The preview: the console's picture, an arrow, and the screen with the picked choice.</summary>
         FrameworkElement FillPreview()
         {
-            double ratio = SystemCheck.WidestScreenRatio();
+            fillHost = new ContentControl();
+            System.Windows.Automation.AutomationProperties.SetName(fillHost, "Fill the screen preview");
+            fillMonitor = "\0";
+            UpdateFillPreview(SettingText("monitor"), true);
+            return fillHost;
+        }
+
+        void UpdateFillPreview(string monitor, bool force = false)
+        {
+            if (fillHost == null || (!force && monitor == fillMonitor)) return;
+            fillMonitor = monitor;
+            double ratio = SystemCheck.ScreenRatio(monitor);
             bool own = ratio > 1.85;  // an ultrawide here; else an example one
             if (!own) ratio = 21.0 / 9.0;
             string shape = ratio >= 3.2 ? "32:9" : ratio >= 2.2 ? "21:9" : null;
@@ -45,8 +58,10 @@ namespace SmoovPlay
             row.Children.Add(Captioned(src, "From the console: 16:9"));
             row.Children.Add(new TextBlock { Text = "→", FontSize = 16, Foreground = R("Muted"), Margin = new Thickness(10, FillPad + FillH / 2 - 12, 10, 0) });
             row.Children.Add(Captioned(screen, own ? "Your " + (shape ?? "wide") + " screen" : "On a 21:9 ultrawide"));
-            System.Windows.Automation.AutomationProperties.SetName(row, "Fill the screen preview");
-            return row;
+            fillHost.Content = row;
+            SettingRow fillRow;
+            if (settingRows.TryGetValue("fill", out fillRow) && fillRow.Hint != null)
+                fillRow.Hint.Margin = new Thickness(18, FillPad, 0, 0);
         }
 
         FrameworkElement Captioned(FrameworkElement drawing, string caption)

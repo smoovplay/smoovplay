@@ -92,52 +92,33 @@ class Display:
     height: int
     hz: int  # the refresh rate Windows runs it at
     max_hz: int  # the fastest it can run at this resolution
+    name: str = ""
+    hdr: bool = False
+
+
+def _to_display(mon) -> Display | None:
+    if mon is None:
+        return None
+    return Display(mon.width, mon.height, mon.hz, mon.max_hz, name=mon.name, hdr=mon.hdr)
 
 
 def primary_display() -> Display | None:
-    """The main display (where the video window opens), or None if it can't be read (not Windows)."""
+    """The main display (where the video window opens by default), or None if it can't be read (not Windows)."""
     if sys.platform != "win32":
         return None
-    import ctypes
-    from ctypes import wintypes as wt
+    from .displays import resolve_monitor
+    return _to_display(resolve_monitor("primary"))
 
-    class DisplayDevice(ctypes.Structure):
-        _fields_ = [("cb", wt.DWORD), ("DeviceName", wt.WCHAR * 32), ("DeviceString", wt.WCHAR * 128),
-                    ("StateFlags", wt.DWORD), ("DeviceID", wt.WCHAR * 128), ("DeviceKey", wt.WCHAR * 128)]
 
-    class DevMode(ctypes.Structure):
-        _fields_ = [("dmDeviceName", wt.WCHAR * 32), ("dmSpecVersion", wt.WORD), ("dmDriverVersion", wt.WORD),
-                    ("dmSize", wt.WORD), ("dmDriverExtra", wt.WORD), ("dmFields", wt.DWORD),
-                    ("dmPositionX", wt.LONG), ("dmPositionY", wt.LONG), ("dmDisplayOrientation", wt.DWORD),
-                    ("dmDisplayFixedOutput", wt.DWORD), ("dmColor", ctypes.c_short), ("dmDuplex", ctypes.c_short),
-                    ("dmYResolution", ctypes.c_short), ("dmTTOption", ctypes.c_short), ("dmCollate", ctypes.c_short),
-                    ("dmFormName", wt.WCHAR * 32), ("dmLogPixels", wt.WORD), ("dmBitsPerPel", wt.DWORD),
-                    ("dmPelsWidth", wt.DWORD), ("dmPelsHeight", wt.DWORD), ("dmDisplayFlags", wt.DWORD),
-                    ("dmDisplayFrequency", wt.DWORD), ("dmICMMethod", wt.DWORD), ("dmICMIntent", wt.DWORD),
-                    ("dmMediaType", wt.DWORD), ("dmDitherType", wt.DWORD), ("dmReserved1", wt.DWORD),
-                    ("dmReserved2", wt.DWORD), ("dmPanningWidth", wt.DWORD), ("dmPanningHeight", wt.DWORD)]
-
-    u32 = ctypes.windll.user32
-    dd = DisplayDevice(cb=ctypes.sizeof(DisplayDevice))
-    i, name = 0, None
-    while u32.EnumDisplayDevicesW(None, i, ctypes.byref(dd), 0):
-        if dd.StateFlags & 4:  # DISPLAY_DEVICE_PRIMARY_DEVICE
-            name = dd.DeviceName
-            break
-        i += 1
-        dd = DisplayDevice(cb=ctypes.sizeof(DisplayDevice))
-    now = DevMode(dmSize=ctypes.sizeof(DevMode))
-    if not u32.EnumDisplaySettingsW(name, -1, ctypes.byref(now)):  # ENUM_CURRENT_SETTINGS
+def selected_display(monitor: str | None = None) -> Display | None:
+    """The chosen display (from settings `monitor`), falling back to primary_display()."""
+    if not monitor or monitor == "primary":
+        return primary_display()
+    if sys.platform != "win32":
         return None
-    best, m = now.dmDisplayFrequency, 0
-    while True:
-        mode = DevMode(dmSize=ctypes.sizeof(DevMode))
-        if not u32.EnumDisplaySettingsW(name, m, ctypes.byref(mode)):
-            break
-        if (mode.dmPelsWidth, mode.dmPelsHeight) == (now.dmPelsWidth, now.dmPelsHeight):
-            best = max(best, mode.dmDisplayFrequency)
-        m += 1
-    return Display(now.dmPelsWidth, now.dmPelsHeight, now.dmDisplayFrequency, best)
+    from .displays import resolve_monitor
+    picked = _to_display(resolve_monitor(monitor, fallback=False))
+    return picked if picked is not None else primary_display()
 
 
 def nvidia_smi(samples: int = 3) -> dict:
@@ -492,7 +473,7 @@ def detect(current: dict, log: Callable[[str], None] = print, timing: dict | Non
     timing, vfg: use these times instead of timing RIFE and NVIDIA VFG (for testing the launcher without loading the
     graphics card). With timing but no vfg, VFG isn't timed or suggested."""
     log("reading the display")
-    display = primary_display()
+    display = selected_display(current.get("monitor"))
     smi = nvidia_smi()
     log("starting the graphics card")
     import torch
@@ -540,7 +521,11 @@ def detect(current: dict, log: Callable[[str], None] = print, timing: dict | Non
          "detail": f"Full motion detail, {engines[full['engine']]}{' (estimated)' if full['estimated'] else ''}. "
                    f"Half: {half['ms']:.1f} ms, {engines[half['engine']]}."},
         {"label": "Display", "value": f"{display.width}×{display.height} at {display.hz} Hz" if display else "Unknown",
-         "detail": f"Can run at {display.max_hz} Hz" if display and display.max_hz > display.hz + 5 else ""},
+         "detail": " · ".join(x for x in (
+             display.name if display else "",
+             "HDR on" if display and display.hdr else "",
+             f"Can run at {display.max_hz} Hz" if display and display.max_hz > display.hz + 5 else "",
+         ) if x)},
         {"label": "TensorRT", "value": "NVIDIA cards only" if dml_mode else "Installed" if trt else "Not installed",
          "detail": ""},
         {"label": "RTX VSR", "value": "NVIDIA cards only" if dml_mode else "Ready" if vsr is None else "Not set up",

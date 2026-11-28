@@ -310,13 +310,13 @@ KEEP_HDR_REASON = ("With Windows' HDR on, the window always uses the low-delay p
                    "the display to SDR in fullscreen, which changes the colours.")
 
 
-def windows_hdr_on() -> bool:
-    """Whether the main display, where fullscreen goes, has Windows' HDR on (False if it can't be told)."""
+def windows_hdr_on(device: str | None = None) -> bool:
+    """Whether the chosen display (or main display, if None) has Windows' HDR on (False if it can't be told)."""
     if sys.platform != "win32":
         return False
     try:
         from .dxgi_present import display_hdr
-        d = display_hdr()
+        d = display_hdr(device=device) if device else display_hdr()
         return bool(d and d["hdr"])
     except Exception:  # noqa: BLE001 - unknown: OpenGL's own presentation, as before
         return False
@@ -553,7 +553,7 @@ class GLWindowSink:
 
     def __init__(self, w: int, h: int, settings=None, restart_reasons=None, choices: dict | None = None,
                  unavailable: dict | None = None, overlay_of=None, hdr: bool = False, hdr_peak: float = 1000.0,
-                 window_keys: dict | None = None, clean_source: bool = False) -> None:
+                 window_keys: dict | None = None, clean_source: bool = False, monitor=None) -> None:
         import glfw
         from OpenGL import GL
 
@@ -566,11 +566,19 @@ class GLWindowSink:
         self.glfw, self.GL, self.w, self.h = glfw, GL, w, h
         if not glfw.init():
             raise RuntimeError("glfw init failed")
+        if monitor is not None and overlay_of is None:
+            self.target_monitor = monitor
+        elif overlay_of is None and getattr(st, "monitor", "primary") != "primary":
+            from .displays import resolve_monitor
+            self.target_monitor = resolve_monitor(st.monitor)
+        else:
+            self.target_monitor = None
         self.dx = None  # a DxgiPresenter when the window presents through DXGI (_choose_presentation)
         self.overlay_of = overlay_of
         self.hdr10 = False  # presenting HDR10 (hdr asked for, and the swap chain could be made)
         self.keep_hdr = False  # presenting SDR through DXGI because Windows' HDR is on (KEEP_HDR)
         self.fs_style = FULLSCREEN_STYLE
+        self.windowed_pos = None
         self._choose_presentation(w, h, hdr, hdr_peak)
         if self.dx is None:
             if overlay_of is not None:  # borderless, on top, click-through, and not focused when it opens
@@ -578,17 +586,22 @@ class GLWindowSink:
                                     (glfw.FOCUSED, glfw.FALSE), (glfw.FOCUS_ON_SHOW, glfw.FALSE),
                                     (glfw.MOUSE_PASSTHROUGH, glfw.TRUE)):
                     glfw.window_hint(hint, value)
+            else:
+                glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
             context_hints(glfw)  # OpenGL 4.1 core on a Mac, for the shaders
             ww, wh = _first_size(glfw, w, h)
             self.win = self.glwin = glfw.create_window(ww, wh, "SmoovPlay", None, None)
             glfw.default_window_hints()
+            if overlay_of is None:
+                self.windowed_pos = self._place_on_monitor(self.win, ww, wh)
+                glfw.show_window(self.win)
             glfw.make_context_current(self.win)
         glfw.swap_interval(1 if st.vsync else 0)
         # Fullscreen stays up when another window takes the focus (a click on a second display, a notification), as
         # borderless fullscreen does in games. GLFW's default minimises it, which with DXGI could also stall Present.
         glfw.set_window_attrib(self.win, glfw.AUTO_ICONIFY, glfw.FALSE)
         self._set_icon(glfw)
-        self.overlay, self.cmd, self.windowed_pos, self.remote = st.overlay, None, None, None
+        self.overlay, self.cmd, self.remote = st.overlay, None, None
         self.fill, self.panorama = st.fill, None  # Fill the screen (framegen/fill.py); Panorama's pass once used
         self._borderless = False  # fullscreen as a borderless window (_set_borderless)
         glfw.set_key_callback(self.win, self._on_key)
@@ -848,11 +861,13 @@ class GLWindowSink:
 
     def _choose_presentation(self, w: int, h: int, hdr: bool, hdr_peak: float) -> None:
         """How frames reach the screen: self.dx, a DXGI swap chain, or None for OpenGL's own; and how fullscreen is
-        done (self.fs_style). DXGI for HDR output (hdr), when the main display has Windows' HDR on (KEEP_HDR), and for
-        settings "present" = Low delay in a window. Window capture's overlay always draws with OpenGL."""
+        done (self.fs_style). DXGI for HDR output (hdr), when the chosen display has Windows' HDR on (KEEP_HDR), and
+        for settings "present" = Low delay in a window. Window capture's overlay always draws with OpenGL."""
         st = self.settings
         if self.overlay_of is None:
-            hdr_on = KEEP_HDR and windows_hdr_on()
+            mon = getattr(self, "target_monitor", None)
+            device = mon.device if mon is not None else None
+            hdr_on = KEEP_HDR and (windows_hdr_on(device) if device else windows_hdr_on())
             if hdr:
                 self._open_dxgi(w, h, hdr=True, peak=hdr_peak)
                 self.hdr10 = self.dx is not None
@@ -900,10 +915,13 @@ class GLWindowSink:
             if not glwin:
                 raise RuntimeError("couldn't open an OpenGL context")
             glfw.window_hint(glfw.CLIENT_API, glfw.NO_API)
+            glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
             win = glfw.create_window(min(w, 1600), min(h, 900), "SmoovPlay", None, None)
             glfw.default_window_hints()
             if not win:
                 raise RuntimeError("couldn't open the window")
+            self.windowed_pos = self._place_on_monitor(win, min(w, 1600), min(h, 900))
+            glfw.show_window(win)
             glfw.make_context_current(glwin)
             fw, fh = glfw.get_framebuffer_size(win)
             self.dx = DxgiPresenter(self.GL, glfw.get_win32_window(win), fw, fh, hdr=hdr, peak_nits=peak)
@@ -924,6 +942,7 @@ class GLWindowSink:
                 if wnd:
                     glfw.destroy_window(wnd)
             self.dx = None
+            self.windowed_pos = None
             if hdr:
                 print(f"[display] HDR output unavailable ({str(e)[:200]}); showing HDR in SDR")
             elif keep_hdr:
@@ -991,11 +1010,26 @@ class GLWindowSink:
                 self.toast("Fullscreen starts next time you press Play: Low delay works in a window only", 5.0)
                 return
             self._set_fullscreen(st.fullscreen)
-            if (st.fullscreen and self.dx is None and self.overlay_of is None and KEEP_HDR and windows_hdr_on()):
-                # Windows' HDR was turned on after the window opened (with OpenGL's own presentation)
-                self.toast("Windows' HDR is on now: fullscreen switches the display to SDR until you press Play again",
-                           6.0)
-                return
+            if st.fullscreen and self.dx is None and self.overlay_of is None and KEEP_HDR:
+                device = None
+                if sys.platform == "win32" and hasattr(glfw, "get_win32_adapter"):
+                    try:
+                        device = glfw.get_win32_adapter(self._monitor_under_window()) or None
+                    except Exception:  # noqa: BLE001
+                        device = None
+                if not device:
+                    mon = getattr(self, "target_monitor", None)
+                    device = mon.device if mon is not None else None
+                if windows_hdr_on(device) if device else windows_hdr_on():
+                    # Windows' HDR was turned on after the window opened (with OpenGL's own presentation)
+                    self.toast("Windows' HDR is on now: fullscreen switches the display to SDR until you press Play again",
+                               6.0)
+                    return
+        elif key == "monitor":
+            if not self.menu.open:
+                from .settings import BY_KEY
+                self.toast(f"Monitor: {BY_KEY['monitor'].name(st.monitor)} (next Play)", 4.0)
+            return
         elif key == "vsync":
             glfw.swap_interval(1 if st.vsync else 0)
         elif key in ("look", "look_on"):
@@ -1089,6 +1123,60 @@ class GLWindowSink:
             self._overlay_at = at
             self.glfw.set_window_pos(self.win, r.x, r.y)
             self.glfw.set_window_size(self.win, r.w, r.h)
+
+    def _glfw_monitor(self):
+        """The GLFW monitor matching `target_monitor`, else GLFW's primary monitor."""
+        glfw = self.glfw
+        mon = getattr(self, "target_monitor", None)
+        if mon is None:
+            return glfw.get_primary_monitor()
+        monitors = glfw.get_monitors() or []
+        if sys.platform == "win32" and hasattr(glfw, "get_win32_adapter"):
+            want = mon.device.lower()
+            for m in monitors:
+                try:
+                    if (glfw.get_win32_adapter(m) or "").lower() == want:
+                        return m
+                except Exception:  # noqa: BLE001
+                    pass
+        for m in monitors:
+            try:
+                mx, my = glfw.get_monitor_pos(m)
+                mode = glfw.get_video_mode(m)
+                if (mx, my, mode.size.width, mode.size.height) == (mon.x, mon.y, mon.width, mon.height):
+                    return m
+            except Exception:  # noqa: BLE001
+                pass
+        for m in monitors:
+            try:
+                if glfw.get_monitor_pos(m) == (mon.x, mon.y):
+                    return m
+            except Exception:  # noqa: BLE001
+                pass
+        return glfw.get_primary_monitor()
+
+    def _place_on_monitor(self, win, ww: int, wh: int) -> tuple[int, int, int, int]:
+        """Places a windowed GL/DXGI window centred on the chosen monitor (moving before sizing)."""
+        glfw = self.glfw
+        mon = self._glfw_monitor()
+        ax = ay = aw = ah = 0
+        if mon is not None:
+            if hasattr(glfw, "get_monitor_workarea"):
+                ax, ay, aw, ah = glfw.get_monitor_workarea(mon)
+            if aw <= 0 or ah <= 0:
+                ax, ay = glfw.get_monitor_pos(mon)
+                mode = glfw.get_video_mode(mon)
+                aw, ah = mode.size.width, mode.size.height
+        if aw > 0 and ah > 0:
+            ww = min(ww, max(320, aw - 80))
+            wh = min(wh, max(180, ah - 80))
+            wx = ax + max(0, (aw - ww) // 2)
+            wy = ay + max(40 if ah > wh + 40 else 0, (ah - wh) // 2)
+        else:
+            wx, wy = 80, 80
+        glfw.set_window_pos(win, wx, wy)
+        glfw.set_window_size(win, ww, wh)
+        return (wx, wy, ww, wh)
 
     def _set_fullscreen(self, on: bool) -> None:
         glfw, win = self.glfw, self.win
@@ -1597,9 +1685,11 @@ class WindowSink:
 
     NAME = "SmoovPlay"
 
-    def __init__(self, w: int, h: int) -> None:
+    def __init__(self, w: int, h: int, monitor=None) -> None:
         cv2.namedWindow(self.NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
         cv2.resizeWindow(self.NAME, min(w, 1600), min(h, 900))
+        if monitor is not None:
+            cv2.moveWindow(self.NAME, monitor.x + 80, monitor.y + 80)
         self.full = False
         self.overlay = True
 
