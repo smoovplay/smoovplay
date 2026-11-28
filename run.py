@@ -617,7 +617,6 @@ def main() -> int:
         unavailable["model"] = f"RIFE {test_model}, set by --model on the command line, for testing."
     if dml_mode:
         unavailable["engine"] = "Without an NVIDIA card, RIFE runs through DirectML (Experimental)."
-        unavailable["steady_hud"] = "Not with DirectML yet."
         unavailable.setdefault("model", "NVIDIA VFG needs an NVIDIA RTX card.")
     choices = {"engine": ("auto", "trt", "torch") if has_trt else ("auto", "torch"),
                "model": tuple(m for m in BY_KEY["model"].choices if m != "vfg" or not vfg_why[0])}
@@ -802,6 +801,10 @@ def main() -> int:
                 remote.publish()  # the restart list starts empty again
             label = label_of(cfg)
             pipe = Pipeline(interp, make_detector(src.info, a.dup_threshold))
+            # Debug snapshots (framegen/debugsnap.py) go beside the session's log, else into out/
+            r = Path(a.results) if a.results else None
+            pipe.debug_dir = (r.with_name("debug-" + (r.stem.split("-", 1)[1] if "-" in r.stem else r.stem)) if r
+                              else Path("out") / time.strftime("debug-%Y%m%d-%H%M%S"))
             live[:] = [pipe, cfg]
             stats = pipe.run(ticks, sink if sink.sinks else None, score=a.score, label=label,
                              on_tick=getattr(src, "log_tick", None), settings=settings,

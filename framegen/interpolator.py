@@ -211,6 +211,13 @@ class RifeInterpolator:
                 self._steady_mask(old, self._slot)
         self.steady = threshold
 
+    def steady_mask_now(self):
+        """The current pair's Steady HUD mask (HxW numpy, 1 = the real pixels), or None while it's off. For debug
+        snapshots: it copies the mask to the CPU, so it isn't for every frame."""
+        if self.steady <= 0:
+            return None
+        return self.hud.w[0, 0, : self.h, : self.w].float().cpu().numpy()
+
     def _capture(self, fn) -> torch.cuda.CUDAGraph:
         with CAPTURE_LOCK:
             return self._capture_locked(fn)

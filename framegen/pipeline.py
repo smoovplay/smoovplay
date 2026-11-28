@@ -5,11 +5,12 @@ from __future__ import annotations
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import torch
 
-from . import delaytest
+from . import debugsnap, delaytest
 from .cadence import Action, CadenceScheduler, CutDetector, DipWatch, DuplicateDetector, FrameTimeline, RhythmLock
 from .hdr import level8, to_u8
 from .interpolator import STEADY_HUD_THRESHOLD, RifeInterpolator
@@ -372,6 +373,7 @@ class Pipeline:
         self._out_np = self._out_pinned.numpy()
         self.stats: Stats | None = None  # the running session's, for reports written while it plays
         self.beat = time.perf_counter()  # when run()'s loop last went round (run.py's watchdog reads it)
+        self.debug_dir: Path | None = None  # where Debug snapshots go (framegen/debugsnap.py); run.py sets it
         self.waiting = None  # the source's Waiting while no frame is coming, else None (the watchdog reads it too)
 
     def run(self, source, sink=None, enabled: bool = True, score: bool = False, label: str = "",
@@ -397,6 +399,7 @@ class Pipeline:
             enabled, hz = settings.interp, settings.hz if sink is not None else 60
         it, sched, st = self.interp, CadenceScheduler(), Stats(private=bool(getattr(self.interp, "private", False)))
         steady = None  # Steady HUD as last applied to the interpolator (followed live from settings)
+        real_frames = 0  # new frames prepared while Debug snapshots is on (framegen/debugsnap.py)
         self.stats = st
         quarter_due = False  # 120 Hz: the previous tick interpolated, so this repeat tick owes the 3/4 frame
         behind_ms = 1000 * TICK * 0.6  # start-of-tick lag above which the extra frames are skipped
@@ -549,7 +552,9 @@ class Pipeline:
                     steady = settings.steady_hud
                     if hasattr(it, "set_steady"):
                         it.set_steady(STEADY_HUD_THRESHOLD if steady else 0.0)
-                    print(f"[pipeline] steady HUD {'ON' if steady else 'OFF'}")
+                        print(f"[pipeline] steady HUD {'ON' if steady else 'OFF'}")
+                    elif steady:
+                        print("[pipeline] steady HUD isn't available with this engine")
             t0 = time.perf_counter()
             st.queue_ms.append((t0 - tick.t_arrival) * 1000)
             if torch.is_tensor(tick.frame):  # already on the GPU (hardware decoder)
@@ -701,6 +706,13 @@ class Pipeline:
                     slot = 1 - slot
                     it.prepare(slot)  # (in_u8 holds this tick's frame)
                     in_slot[slot] = added.id
+                    if settings is not None and getattr(settings, "debug", False) and self.debug_dir is not None:
+                        real_frames += 1
+                        if real_frames % debugsnap.EVERY == 0:
+                            frame = getattr(it, "in_u8", None)
+                            frame = frame.cpu().numpy() if torch.is_tensor(frame) else frame
+                            print(debugsnap.write(self.debug_dir, real_frames // debugsnap.EVERY, frame,
+                                                  debugsnap.mask_of(it)), flush=True)
                 if timed:
                     if dipping:
                         st.dip_ticks += 1

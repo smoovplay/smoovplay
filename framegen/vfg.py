@@ -148,6 +148,13 @@ class VfgInterpolator:
                 self.hud.mask(old, self._slot, self.real[old], self.real[self._slot])
         self.steady = threshold
 
+    def steady_mask_now(self):
+        """The current pair's Steady HUD mask (HxW numpy, 1 = the real pixels), or None while it's off (debug
+        snapshots)."""
+        if self.steady <= 0 or self.hud is None:
+            return None
+        return self.hud.w[0, 0].float().cpu().numpy()
+
     def _slot_rgb(self, slot: int) -> torch.Tensor:
         """A prepared real frame back from VFG's input format, as (1, 3, h, w) RGB."""
         if self.encoding == "rgb10a2":
