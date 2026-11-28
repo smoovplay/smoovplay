@@ -281,8 +281,15 @@ class _Point(ctypes.Structure):
     _fields_ = [("x", c_long), ("y", c_long)]
 
 
-def display_hdr(hwnd=None) -> dict | None:
-    """The display a window is on (most of it), or without one the main display, from outputs(); None if unknown."""
+def display_hdr(hwnd=None, device: str | None = None) -> dict | None:
+    """The display a window is on (most of it), a given display device (`\\\\.\\DISPLAY1`), or without either the
+    main display, from outputs(); None if unknown."""
+    if device:
+        low = device.lower()
+        for o in outputs():
+            if o["name"].lower() == low:
+                return o
+        return None
     u32 = ctypes.WinDLL("user32")
     if hwnd is not None:
         u32.MonitorFromWindow.argtypes, u32.MonitorFromWindow.restype = [c_void_p, c_uint], c_void_p

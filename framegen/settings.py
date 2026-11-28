@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import fill, looks
+from . import displays, fill, looks
 
 DEFAULT_PATH = Path(os.environ.get("APPDATA", Path.home())) / "framegen" / "settings.json"
 
@@ -52,6 +52,8 @@ class Spec:
 
     def applies_to(self, values: dict) -> bool:
         """Whether this setting is used with these values (e.g. VFG quality only while NVIDIA VFG is picked)."""
+        if len(self.choices) <= 1:
+            return False
         return not self.applies or values.get(self.applies[0]) in self.applies[1]
 
     def unused_with(self, source: str) -> str | None:
@@ -264,6 +266,11 @@ SPECS: tuple[Spec, ...] = (
          applies=("look_on", (True,)),
          help="The look to use: SmoovPlay's own, then the ones you made or pasted on the Looks page. J goes to the "
               "next one, Shift+J back."),
+    Spec("monitor", "Monitor", displays.CHOICES, displays.DEFAULT_MONITOR, displays.NAMES, live=False,
+         group="Display", hints=displays.HINTS,
+         help="The screen SmoovPlay opens on. Auto-detect and the HDR check use it too.",
+         sources=("chiaki", "capture", "tap", "file", "sim"),
+         elsewhere={"window": "App window capture stays on the monitor the app's window is on."}),
     Spec("fullscreen", "Fullscreen", (False, True), False, ON_OFF, group="Display",
          help="Fills the whole screen. It also skips the Windows desktop compositor, which removes about 12 ms "
               "of delay, so it's the best way to play. Key: F.",

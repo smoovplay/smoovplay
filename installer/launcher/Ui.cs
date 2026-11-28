@@ -235,6 +235,9 @@ namespace SmoovPlay
             Click("BtnMin", () => Window.WindowState = WindowState.Minimized);
             Click("BtnClose", () => Window.Close());
             Window.Closing += OnClosing;
+            EventHandler displayChanged = (s, e) => OnUi(() => { settingSpecsStale = true; if (page == "PageSettings") LoadSettingSpecs(true); });
+            Microsoft.Win32.SystemEvents.DisplaySettingsChanged += displayChanged;
+            Window.Closed += (s, e) => Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= displayChanged;
             Window.Activated += (s, e) => UpdateAmbient();
             Window.Deactivated += (s, e) => UpdateAmbient();
             Window.StateChanged += (s, e) => UpdateAmbient();
@@ -1326,6 +1329,7 @@ namespace SmoovPlay
             if (!changed) return;
             checks = null;  // the PC check's last card depends on the source
             if (settingRows.Count > 0) RefreshSettings();  // settings only used with some sources (Spec.sources)
+            BuildChips();
             if (playState == PlayState.Idle) SetPlayState(PlayState.Idle, null);
             Show(B("BtnPlayTest"), !(session != null && session.Running) && source.TestMode);
             if (page == "PageGuide") BuildGuide();
@@ -1647,6 +1651,14 @@ namespace SmoovPlay
             Chip(chips, "\uEC4A", on ? hz + " fps" : "Frame generation off");
             Chip(chips, "\uE7B3", scaler == "vsr" ? "NVIDIA RTX VSR" : scaler == "bilinear" ? "Bilinear" : "AMD FSR 1");
             Chip(chips, "\uE950", vfg ? "NVIDIA VFG" : engine == "trt" ? "TensorRT" : engine == "torch" ? "PyTorch" : "Engine: auto");
+            if (source != null && source.Kind != "window" && settingSpecs != null)
+            {
+                string mon = SettingText("monitor");
+                var monSpec = settingSpecs.FirstOrDefault(s => s.Key == "monitor");
+                if (!string.IsNullOrEmpty(mon) && mon != "primary" && monSpec != null && monSpec.Choices.Count > 1
+                    && monSpec.Choices.Any(c => Same(c.Key, mon)))
+                    Chip(chips, "\uE7F4", ChoiceName(monSpec, mon));
+            }
             chips.ToolTip = "Change these on the Settings page, or press M in the video window.";
         }
 

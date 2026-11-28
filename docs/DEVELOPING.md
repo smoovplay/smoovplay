@@ -118,7 +118,7 @@ dropdown has a line on when to pick it.
 and upscaler for this PC, with the reason for each; **Apply** sets them. It takes about 10 seconds:
 
 - It times RIFE on a 1080p frame, at full and half motion detail, with the engine Auto would use.
-- It reads the main display's refresh rate and resolution, and checks for TensorRT and RTX VSR.
+- It reads the chosen display's refresh rate and resolution (from the Monitor setting, or the main display by default), and checks for TensorRT and RTX VSR.
 - It picks the fastest frame rate the display can show where an in-between frame fits in 90% of a display tick.
   That margin is calibrated from live tests on an RTX 4070 Ti SUPER. 90 fps at full detail is preferred over 120 at
   half, as in testing.
@@ -141,6 +141,7 @@ made-up PCs.
 | Upscaler | AMD FSR 1 / NVIDIA RTX VSR / Bilinear (others may come later) | live |
 | Sharpening | Off / Minimal … Max (AMD RCAS after any upscaler, or none; a level carried over from FSR sharpening applies only while FSR 1 enlarges until it's changed) | live |
 | RTX VSR quality | Low / Medium / High / Ultra (Experimental: RTX VSR comes with NVIDIA VFG's download) | live |
+| Monitor | Main display / each connected display (shown with more than one display) | next Play |
 | Stats overlay, Fullscreen, VSync | On / Off | live |
 | Stats overlay style | Minimal (frames on screen, the game's rate, the delay, a keeping-up dot) / Detailed | live |
 | Stats overlay position, size | Top left / Top right / Bottom left / Bottom right; Small (out of the HUD's way) / Medium / Large | live |
@@ -199,8 +200,9 @@ draws looks on the sample pictures (`framegen/samples`) with the video window's 
 `python -m framegen.looks preview LOOK IN.png OUT.png` puts a look (an id or a code) on a picture.
 
 Command-line flags (`--hz`, `--scaler`, `--sharpening`, `--vsr-quality`, `--engine`/`--trt`, `--off`,
-`--vsync`, `--fullscreen`, `--minimize-chiaki`, `--steady-hud`, `--present gl|dxgi`, `--test-mode`, `--model vfg`
-with `--vfg-quality`) override the saved settings for one run without saving them;
+`--vsync`, `--fullscreen`, `--monitor`, `--minimize-chiaki`, `--steady-hud`, `--present gl|dxgi`, `--test-mode`,
+`--model vfg` with
+`--vfg-quality`) override the saved settings for one run without saving them;
 `--settings none` starts from defaults and saves nothing. `--model 4.25.lite|4.25|4.26` tries another RIFE
 version for testing; those aren't offered in the menus until they're tested for real-time play and setup prepares
 them.

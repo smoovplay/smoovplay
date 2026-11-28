@@ -346,6 +346,10 @@ def main() -> int:
     ap.add_argument("--vsync", action=argparse.BooleanOptionalAction, default=None,
                     help="vsync the window (use with G-Sync/FreeSync displays)")
     ap.add_argument("--fullscreen", action=argparse.BooleanOptionalAction, default=None, help="start fullscreen")
+    ap.add_argument("--monitor", default=None, metavar="MONITOR",
+                    help="which display to open on and check for HDR, resolution and refresh rate: 'primary', "
+                         "a monitor id, a Windows display name (DISPLAY1), or part of its name. Default: the saved "
+                         "setting")
     ap.add_argument("--fill", default=None, choices=BY_KEY["fill"].choices,
                     help="on a screen that isn't 16:9: fit (bars), zoom (crops), stretch or panorama; all of them the same 16:9 picture")
     ap.add_argument("--hdr", default=None, choices=BY_KEY["hdr"].choices,
@@ -453,6 +457,8 @@ def main() -> int:
         ap.error("give a video file, --capture N or --chiaki")
     print(f"[run] source: {src.info.name}")
 
+    from framegen import displays
+    all_monitors = displays.refresh()
     settings = Settings() if a.settings.lower() == "none" else Settings.load(Path(a.settings))
     for key, value in (("hz", a.hz), ("scaler", a.scaler), ("vsr_quality", a.vsr_quality),
                        ("sharpening", a.sharpening), ("engine", "trt" if a.trt else a.engine),
@@ -462,6 +468,20 @@ def main() -> int:
                        ("hdr", a.hdr), ("fill", a.fill)):
         if value is not None:
             settings.override(key, value)
+    if a.monitor is not None:
+        if a.monitor.lower() == displays.DEFAULT_MONITOR:
+            settings.override("monitor", displays.DEFAULT_MONITOR)
+        else:
+            picked_mon = displays.resolve_monitor(a.monitor, all_monitors, fallback=False)
+            if picked_mon is None:
+                avail = ", ".join(f"{m.name} ({m.id})" for m in all_monitors) or "none"
+                ap.error(f"--monitor: no display matching {a.monitor!r} (found: {avail})")
+            override_val = picked_mon.id if picked_mon.id in BY_KEY["monitor"].choices else displays.DEFAULT_MONITOR
+            settings.override("monitor", override_val)
+    target_mon = displays.resolve_monitor(settings.monitor, all_monitors)
+    if a.display and kind != "window" and target_mon is not None and len(all_monitors) > 1:
+        print(f"[run] monitor: {target_mon.name} ({target_mon.width}x{target_mon.height} @ {target_mon.hz} Hz"
+              + (", HDR" if target_mon.hdr else "") + (", primary" if target_mon.primary else "") + ")")
     # --model: one of the settings' choices, or another RIFE version for testing (not something the menu offers)
     test_model = a.model if a.model is not None and a.model not in BY_KEY["model"].choices else None
     if a.model is not None and test_model is None:
@@ -485,7 +505,7 @@ def main() -> int:
             hdr_out = "sdr8"
             if settings.hdr == "hdr10":
                 from framegen.dxgi_present import HDR_FORCE, display_hdr
-                shown = display_hdr()
+                shown = display_hdr(device=target_mon.device) if target_mon is not None else display_hdr()
                 if not a.display or a.display_cv or a.out:
                     print("[run] HDR output needs the video window; showing HDR in SDR")
                 elif HDR_FORCE or (shown is not None and shown["hdr"]):
@@ -637,12 +657,14 @@ def main() -> int:
     if a.out:
         choices["hz"] = (60,)
         unavailable["hz"] = "90/120 fps can't be recorded with --out yet."
-    window = (WindowSink(src.w, src.h) if a.display_cv else
+    win_mon = None if kind == "window" else target_mon
+    window = (WindowSink(src.w, src.h, monitor=win_mon) if a.display_cv else
               GLWindowSink(src.w, src.h, settings, restart_reasons, choices, unavailable,
                            overlay_of=src.where if kind == "window" else None, hdr=hdr10[0],
                            window_keys=window_keys if kind == "window" else None,
                            hdr_peak=min(hdr_peak or 1e9, 1000.0),
-                           clean_source=kind == "capture" and bool(getattr(src, "raw", False))) if a.display else None)
+                           clean_source=kind == "capture" and bool(getattr(src, "raw", False)),
+                           monitor=win_mon) if a.display else None)
     if hdr10[0] and not getattr(window, "hdr10", False):  # the window couldn't present HDR10: shown in SDR
         hdr10[0], hdr_out, hdr_peak = False, "sdr8", None
         for k in hdr10_rows:
