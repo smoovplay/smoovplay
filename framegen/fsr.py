@@ -4,6 +4,7 @@ Two OpenGL fragment-shader passes where the frame is drawn to the screen:
 EASU (edge-adaptive upscale to the window size) and RCAS (sharpening).
 Because it runs at draw time it scales real and generated frames alike, and it doesn't touch the
 interpolation's CUDA work. The shader code is AMD's own (framegen/shaders/fsr1, MIT licence).
+RCAS also runs on its own (FsrScaler.sharpen): Settings "Sharpening" after RTX VSR, bilinear or no upscaling.
 """
 from __future__ import annotations
 
@@ -35,22 +36,36 @@ void main() {
 }
 """
 
-# Images keep row 0 at the top (texture row 0); the window's row 0 is the bottom, so RCAS flips while it draws.
+# Images keep row 0 at the top (texture row 0); the window's row 0 is the bottom, so RCAS flips while it draws
+# (flip 1). A frame read back from the graphics card (an instant replay clip's) keeps row 0 at the top (flip 0).
 _RCAS = """
 layout(binding = 0) uniform sampler2D mid;
 uniform ivec2 origin;     // window pixel of the image's bottom-left corner
 uniform float sharpness;  // stops below maximum sharpness: 0 = max, each +1 halves it
+uniform int flip;         // 1: upright on the screen; 0: in the image's own row order
 out vec4 color;
 AF4 FsrRcasLoadF(ASU2 p) { return texelFetch(mid, clamp(p, ASU2(0), textureSize(mid, 0) - 1), 0); }
 void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
 void main() {
     ivec2 q = ivec2(gl_FragCoord.xy) - origin;
-    AU2 ip = AU2(q.x, textureSize(mid, 0).y - 1 - q.y);
+    AU2 ip = AU2(q.x, flip != 0 ? textureSize(mid, 0).y - 1 - q.y : q.y);
     AU4 con;
     FsrRcasCon(con, sharpness);
     AF1 r, g, b;
     FsrRcasF(r, g, b, ip, con);
     color = vec4(r, g, b, 1.0);
+}
+"""
+
+# EASU's picture as it is, with Sharpening off: RCAS's flip and placement, and no sharpening.
+_COPY = """#version 450
+layout(binding = 0) uniform sampler2D mid;
+uniform ivec2 origin;
+uniform int flip;
+out vec4 color;
+void main() {
+    ivec2 q = ivec2(gl_FragCoord.xy) - origin;
+    color = vec4(texelFetch(mid, ivec2(q.x, flip != 0 ? textureSize(mid, 0).y - 1 - q.y : q.y), 0).rgb, 1.0);
 }
 """
 
@@ -62,20 +77,25 @@ def _source(defines: str, body: str) -> str:
 
 
 class FsrScaler:
-    """FSR 1 upscaling of a GL texture into a rectangle of a framebuffer. Needs a current GL 4.5 context (on a Mac,
-    the 4.1 core one framegen/glsl.py asks for)."""
+    """FSR 1 upscaling of a GL texture into a rectangle of a framebuffer, and RCAS sharpening on its own. Needs a
+    current GL 4.5 context (on a Mac, the 4.1 core one framegen/glsl.py asks for).
+    sharpness: RCAS's, in stops below its maximum (settings.SHARPEN_STOPS), or None for none."""
 
-    def __init__(self, GL, sharpness: float = 0.5, denoise: bool = True, hdr: bool = False) -> None:
+    def __init__(self, GL, sharpness: float | None = 0.5, denoise: bool = True, hdr: bool = False) -> None:
         """hdr: the picture is HDR10 (PQ values, framegen/hdr.py), so EASU's output is kept in half floats rather
         than 8 bits. FSR 1 is made for perceptual values, which PQ's are, as SDR's gamma ones are."""
-        self.GL, self.sharpness, self.hdr = GL, float(sharpness), hdr
+        self.GL, self.sharpness, self.hdr = GL, sharpness, hdr
         rcas_defs = "#define FSR_RCAS_F 1\n" + ("#define FSR_RCAS_DENOISE 1\n" if denoise else "")
         self.easu = self._program(_source("#define FSR_EASU_F 1\n", _EASU))
         self.rcas = self._program(_source(rcas_defs, _RCAS))
+        self.copy = self._program(_COPY)
         self.u_in = GL.glGetUniformLocation(self.easu, "in_size")
         self.u_out = GL.glGetUniformLocation(self.easu, "out_size")
         self.u_origin = GL.glGetUniformLocation(self.rcas, "origin")
         self.u_sharp = GL.glGetUniformLocation(self.rcas, "sharpness")
+        self.u_flip = GL.glGetUniformLocation(self.rcas, "flip")
+        self.u_copy_origin = GL.glGetUniformLocation(self.copy, "origin")
+        self.u_copy_flip = GL.glGetUniformLocation(self.copy, "flip")
         self.vao = GL.glGenVertexArrays(1)
         self.mid_tex = self.mid_fbo = None
         self.mid_size = (0, 0)
@@ -83,6 +103,12 @@ class FsrScaler:
     def _program(self, frag: str) -> int:
         from .glsl import program
         return program(self.GL, _VERT, frag)
+
+    def stage(self, w: int, h: int) -> tuple[int, int]:
+        """The texture RCAS reads, at w x h, and its framebuffer: for a picture resized another way first (bilinear)
+        and then sharpened with sharpen(). Row 0 is the image's top. Shared with draw(), which fills it with EASU."""
+        self._mid(w, h)
+        return self.mid_tex, self.mid_fbo
 
     def _mid(self, w: int, h: int) -> None:
         """The EASU output: an RGBA8 (HDR: RGBA16F) texture at the upscaled size, re-made when the window size
@@ -123,12 +149,33 @@ class FsrScaler:
         GL.glBindTexture(GL.GL_TEXTURE_2D, src_tex)
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
 
+        self._finish(self.mid_tex, dst_fbo, x0, y0, dw, dh, self.sharpness, True)
+
+    def sharpen(self, src_tex: int, dst_fbo: int, x0: int, y0: int, dw: int, dh: int, sharpness: float,
+                flip: bool = True) -> None:
+        """RCAS alone, on a picture that's already its final size (src_tex is dw x dh, row 0 = image top: RTX VSR's
+        output, the frame itself, or stage()'s texture), into dst_fbo's rectangle at (x0, y0). flip: upright on the
+        screen; False keeps the image's row order (a clip's frame, read back). Leaves dst_fbo bound."""
+        self.GL.glBindVertexArray(self.vao)
+        self.GL.glActiveTexture(self.GL.GL_TEXTURE0)
+        self._finish(src_tex, dst_fbo, x0, y0, dw, dh, sharpness, flip)
+
+    def _finish(self, tex: int, dst_fbo: int, x0: int, y0: int, dw: int, dh: int, sharpness: float | None,
+                flip: bool) -> None:
+        """tex (dw x dh) into dst_fbo at (x0, y0): sharpened with RCAS, or as it is when sharpness is None."""
+        GL = self.GL
         GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, dst_fbo)
         GL.glViewport(x0, y0, dw, dh)
-        GL.glUseProgram(self.rcas)
-        GL.glUniform2i(self.u_origin, x0, y0)
-        GL.glUniform1f(self.u_sharp, self.sharpness)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self.mid_tex)
+        if sharpness is None:
+            GL.glUseProgram(self.copy)
+            GL.glUniform2i(self.u_copy_origin, x0, y0)
+            GL.glUniform1i(self.u_copy_flip, int(flip))
+        else:
+            GL.glUseProgram(self.rcas)
+            GL.glUniform2i(self.u_origin, x0, y0)
+            GL.glUniform1f(self.u_sharp, float(sharpness))
+            GL.glUniform1i(self.u_flip, int(flip))
+        GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
 
         GL.glUseProgram(0)
@@ -141,6 +188,7 @@ class FsrScaler:
             GL.glDeleteTextures([self.mid_tex])
         GL.glDeleteProgram(self.easu)
         GL.glDeleteProgram(self.rcas)
+        GL.glDeleteProgram(self.copy)
         GL.glDeleteVertexArrays(1, [self.vao])
 
 

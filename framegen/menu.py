@@ -70,10 +70,10 @@ class Menu:
         values = self.settings.values()
         if page is None:
             rows: list[Row] = [("setting", s) for s in self.specs
-                               if (s.quick and s.live or not s.group) and s.applies_to(values)]
+                               if (s.quick and s.live or not s.group) and not s.hidden and s.applies_to(values)]
             rows += [("section", g) for g in self.sections()]
         else:
-            rows = [("setting", s) for s in self.specs if s.group == page and s.applies_to(values)]
+            rows = [("setting", s) for s in self.specs if s.group == page and not s.hidden and s.applies_to(values)]
         if self.restart_reasons():
             rows.append(("restart", None))
         return rows

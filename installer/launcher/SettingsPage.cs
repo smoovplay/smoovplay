@@ -4,10 +4,11 @@
 // Layout: the few big choices first ("quick" in the list: frame rate, model, upscaler), as rows of choices you can
 // see at a glance, then Auto-detect, then everything else in folding sections, one per group (one column, or two in
 // a wide window). A section remembers whether it's open (launcher prefs, "set-open:<group>"). A setting that only
-// matters with another one ("applies" in the list, e.g. FSR sharpening with AMD FSR 1) is hidden while it doesn't.
+// matters with another one ("applies" in the list, e.g. RTX VSR quality with RTX VSR) is hidden while it doesn't.
 // Two to four choices show as a row of choices with the picked one's hint under it; more as a dropdown.
 //
-// Nothing playing: a change is written to the settings file, which the next session reads.
+// Nothing playing: a change is written to the settings file, which the next session reads (with the keys its "also"
+// lists, as framegen/settings.py's Settings.set writes them).
 // Playing: a change goes to the running pipeline (Session.Send, framegen/remote.py) and reaches the video straight
 // away, exactly as if it were picked in the video window's menu (M). The page then follows the pipeline's
 // "[settings-state]" lines, so changes made in that menu or with its keys show up here too, along with which choices
@@ -48,6 +49,7 @@ namespace SmoovPlay
             public readonly List<object> AppliesValues = new List<object>();
             public readonly List<string> Sources = new List<string>();  // only used with these sources (none: all)
             public readonly Dictionary<string, string> Elsewhere = new Dictionary<string, string>();  // source -> why not ("": any)
+            public readonly Dictionary<string, object> Also = new Dictionary<string, object>();  // set with this one
             public bool OnOff { get { return Choices.Count == 2 && Choices.All(c => c.Key is bool); } }
 
             public string Hint(object value)
@@ -174,6 +176,8 @@ namespace SmoovPlay
                     s.Sources.AddRange(((object[])d["sources"]).OfType<string>());
                 if (d.ContainsKey("elsewhere") && d["elsewhere"] is Dictionary<string, object>)
                     foreach (var kv in (Dictionary<string, object>)d["elsewhere"]) s.Elsewhere[kv.Key] = kv.Value as string;
+                if (d.ContainsKey("also") && d["also"] is Dictionary<string, object>)
+                    foreach (var kv in (Dictionary<string, object>)d["also"]) s.Also[kv.Key] = kv.Value;
                 var impact = d.ContainsKey("impact") ? d["impact"] as Dictionary<string, object> : null;
                 if (impact != null)
                 {
@@ -797,7 +801,11 @@ namespace SmoovPlay
                 return;
             }
             if (SessionRunning) { RefreshSettings(); return; }  // locked meanwhile
-            try { WriteSetting(spec.Key, value); }
+            try
+            {
+                WriteSetting(spec.Key, value);
+                foreach (var kv in spec.Also) WriteSetting(kv.Key, kv.Value);  // e.g. Sharpening: not carried over
+            }
             catch (Exception e) { Toast("Couldn't save the setting: " + e.Message, true); }
             RefreshSettings();
             BuildChips();

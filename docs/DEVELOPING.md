@@ -139,7 +139,7 @@ made-up PCs.
 | Even out 40-60 fps | On / Off (Experimental: even motion for games between 30 and 60 fps) | live |
 | Dip smoothing | Off / On (Experimental: a 30 fps game's dips become a brief slow-down) | live |
 | Upscaler | AMD FSR 1 / NVIDIA RTX VSR / Bilinear (others may come later) | live |
-| FSR sharpening | Max … Minimal | live |
+| Sharpening | Off / Minimal … Max (AMD RCAS after any upscaler, or none; a level carried over from FSR sharpening applies only while FSR 1 enlarges until it's changed) | live |
 | RTX VSR quality | Low / Medium / High / Ultra (Experimental: RTX VSR comes with NVIDIA VFG's download) | live |
 | Stats overlay, Fullscreen, VSync | On / Off | live |
 | Stats overlay style | Minimal (frames on screen, the game's rate, the delay, a keeping-up dot) / Detailed | live |
@@ -198,7 +198,7 @@ draws looks on the sample pictures (`framegen/samples`) with the video window's 
 (about a millisecond a picture; NumPy without OpenGL), one JSON request per line on stdin.
 `python -m framegen.looks preview LOOK IN.png OUT.png` puts a look (an id or a code) on a picture.
 
-Command-line flags (`--hz`, `--scaler`, `--fsr-sharpness`, `--vsr-quality`, `--engine`/`--trt`, `--off`,
+Command-line flags (`--hz`, `--scaler`, `--sharpening`, `--vsr-quality`, `--engine`/`--trt`, `--off`,
 `--vsync`, `--fullscreen`, `--minimize-chiaki`, `--steady-hud`, `--present gl|dxgi`, `--test-mode`, `--model vfg`
 with `--vfg-quality`) override the saved settings for one run without saving them;
 `--settings none` starts from defaults and saves nothing. `--model 4.25.lite|4.25|4.26` tries another RIFE

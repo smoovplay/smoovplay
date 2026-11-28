@@ -349,8 +349,9 @@ def main() -> int:
                          "vsr = NVIDIA RTX Video Super Resolution, needs the RTX Video SDK (framegen/rtxvsr.py)")
     ap.add_argument("--vsr-quality", type=int, default=None, choices=[1, 2, 3, 4],
                     help="RTX VSR quality: 1 low ... 4 ultra (more GPU time per frame)")
-    ap.add_argument("--fsr-sharpness", type=float, default=None, choices=BY_KEY["fsr_sharpness"].choices,
-                    help="FSR 1 sharpening, in stops below maximum: 0 = sharpest, 1 = half, 2 = quarter")
+    ap.add_argument("--sharpening", default=None, choices=BY_KEY["sharpening"].choices,
+                    help="AMD RCAS sharpening after any upscaler, or with none (this run only, wherever the picture is "
+                         "drawn, as after changing it in Settings)")
     ap.add_argument("--hz", type=int, default=None, choices=[60, 90, 120],
                     help="output rate for a 30 fps game: 120 = 3 generated frames per real one (half-res flow by "
                          "default), 90 = 2 (needs a VRR/G-Sync screen or a 90 Hz mode to look even). Needs --display; "
@@ -442,7 +443,7 @@ def main() -> int:
 
     settings = Settings() if a.settings.lower() == "none" else Settings.load(Path(a.settings))
     for key, value in (("hz", a.hz), ("scaler", a.scaler), ("vsr_quality", a.vsr_quality),
-                       ("fsr_sharpness", a.fsr_sharpness), ("engine", "trt" if a.trt else a.engine),
+                       ("sharpening", a.sharpening), ("engine", "trt" if a.trt else a.engine),
                        ("interp", False if a.off else None), ("vsync", a.vsync), ("fullscreen", a.fullscreen),
                        ("minimize_chiaki", a.minimize_chiaki), ("simulate_30", True if a.test_mode else None),
                        ("steady_hud", a.steady_hud), ("vfg_quality", a.vfg_quality), ("present", a.present),

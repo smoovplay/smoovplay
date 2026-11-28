@@ -58,7 +58,7 @@ There's nothing to install on the console, and it's free and open source.
   upload and all.
 - **Sharper on big screens.** The 1080p stream is sharpened and scaled to your monitor by AMD FSR 1 (in 0.1 ms),
   or by NVIDIA RTX Video Super Resolution (Experimental), which comes with NVIDIA VFG's download on RTX 40 and 50
-  series cards.
+  series cards. Sharpening works with either, or with no upscaler (a capture card at your screen's size).
 - **Works with what you have.** A PS5 streams over Remote Play on your home network, through the open-source chiaki-ng,
   and your controller connects to the PC. An Xbox through its app, or any console through a capture card, are
   Experimental options.

@@ -43,6 +43,9 @@ class Spec:
     sources: tuple = ()  # only used with these sources (framegen/sources.py kinds; () = all). With another one, the
     # launcher (for the source picked on its Play page) and the in-video menu (run.py) grey it out, with its note:
     elsewhere: dict = field(default_factory=dict)  # source kind -> why it isn't used there ("": any other source)
+    also: dict = field(default_factory=dict)  # key -> value: set too whenever the player sets this one (the menu, the
+    # launcher, a hotkey or the command line), e.g. Sharpening ending the way it was carried over from FSR sharpening
+    hidden: bool = False  # never shown (the menu, the launcher): state kept with the settings, not a choice
 
     def name(self, value: Any) -> str:
         return self.names.get(value, str(value))
@@ -65,6 +68,11 @@ IMPACT_PC = "an RTX 4070 Ti SUPER"  # where the numbers in `impact` and the hint
 # (0.01 to 0.19 ms), measured while chiaki-ng streamed.
 LOOK_SPEED = "About 0.02 to 0.35 ms a frame of graphics card time for SmoovPlay's looks (1440p)."
 LOOK_CLIPS_SPEED = "Up to about 0.2 ms more a frame of graphics card time, to draw it again at 1080p."
+# Sharpening: each level is RCAS's sharpness in stops below its maximum (0 = max, each +1 halves it), as "FSR
+# sharpening" (fsr_sharpness) saved them up to 0.3.14.
+SHARPEN_NAMES = {"off": "Off", "minimal": "Minimal", "low": "Low", "medium": "Medium", "high": "High", "max": "Max"}
+SHARPEN_STOPS = {"minimal": 2.0, "low": 1.0, "medium": 0.5, "high": 0.25, "max": 0.0}
+SHARPEN_SPEED = "Under 0.1 ms a frame of graphics card time (about 0.03 ms at 1440p); none extra with FSR 1."
 
 SPECS: tuple[Spec, ...] = (
     Spec("interp", "Frame generation", (True, False), True, ON_OFF, group="Smoothness", quick=True,
@@ -187,13 +195,21 @@ SPECS: tuple[Spec, ...] = (
          impact={"picture": "Only matters on a display bigger than the stream, like 1440p or 4K.",
                  "speed": "About 0.1 ms a frame for FSR 1. RTX VSR runs an AI model on every frame, which can "
                           "cost in-between frames at 90 and 120 fps."}),
-    Spec("fsr_sharpness", "FSR sharpening", (0.0, 0.25, 0.5, 1.0, 2.0), 0.5,
-         {0.0: "Max", 0.25: "High", 0.5: "Medium", 1.0: "Low", 2.0: "Minimal"}, group="Picture", applies=("scaler", ("fsr",)),
-         hints={0.0: "Crispest. Can make compression blocks stand out.", 0.5: "Balanced. The default.",
-                2.0: "Softest. Best for a blocky, low-quality stream."},
-         help="How strongly FSR 1 sharpens the enlarged picture. More looks crisper; less keeps the blocky patches "
-              "of a weak Wi-Fi stream from standing out. Only used with AMD FSR 1.",
-         impact={"picture": "More is crisper; less keeps a blocky stream calmer.", "speed": "No difference."}),
+    # AMD's RCAS (framegen/fsr.py), after any upscaler or none (#58). It took over "FSR sharpening" (fsr_sharpness, up
+    # to 0.3.14), which sharpened only while FSR 1 enlarged the picture: Settings carries a saved level over with
+    # sharpen_fsr_only, so the picture stays as it was until the player changes Sharpening.
+    Spec("sharpening", "Sharpening", tuple(SHARPEN_NAMES), "medium", SHARPEN_NAMES, group="Picture",
+         also={"sharpen_fsr_only": False},
+         hints={"off": "The picture as the upscaler makes it.",
+                "minimal": "Gentlest. Best for a blocky, low-quality stream.",
+                "medium": "Balanced. The default.", "max": "Crispest. Can make compression blocks stand out."},
+         help="Sharpens the picture after the upscaler, whichever one you use, or with none (like a capture card at "
+              "your screen's size). More looks crisper; less keeps the blocky patches of a weak Wi-Fi stream from "
+              "standing out. It's AMD's RCAS, the sharpening in FSR 1. Until you change it, it works the way FSR "
+              "sharpening did before: only while AMD FSR 1 enlarges the picture.",
+         impact={"picture": "More is crisper; less keeps a blocky stream calmer.", "speed": SHARPEN_SPEED}),
+    Spec("sharpen_fsr_only", "Sharpening only while FSR 1 enlarges", (True, False), True, ON_OFF, hidden=True,
+         help="Sharpening as FSR sharpening did up to 0.3.14, until the player changes Sharpening (its `also`)."),
     Spec("vsr_quality", "RTX VSR quality", (1, 2, 3, 4), 2, {1: "Low", 2: "Medium", 3: "High", 4: "Ultra"},
          group="Picture", applies=("scaler", ("vsr",)), experimental=True,
          help="How hard RTX VSR works to clean up and sharpen the picture. Higher looks cleaner but asks more of the "
@@ -339,8 +355,8 @@ SPECS: tuple[Spec, ...] = (
               "a video twice as wide."),
     Spec("look_clips", "Looks in clips", (False, True), False, ON_OFF, group="Instant replay",
          applies=("replay", (30, 60, 120, 300)),
-         help="Puts the look you're using into saved clips too. Off keeps clips as the game looked, whatever look "
-              "you play with. In a before & after video, only the SmoovPlay side gets the look.",
+         help="Puts the look you're using, and Sharpening, into saved clips too. Off keeps clips as the game looked, "
+              "whatever you play with. In a before & after video, only the SmoovPlay side gets them.",
          impact={"picture": "Clips look like what you see, look included.", "speed": LOOK_CLIPS_SPEED}),
     Spec("minimize_chiaki", "Minimise chiaki-ng", (True, False), True, ON_OFF, group="PS5 Remote Play",
          help="Minimises chiaki-ng's own window while SmoovPlay's video is open, so your graphics card doesn't "
@@ -358,6 +374,25 @@ SPECS: tuple[Spec, ...] = (
 BY_KEY = {s.key: s for s in SPECS}
 
 
+def _carry_over(values: dict) -> tuple[dict, bool]:
+    """A settings file from 0.3.14 or before, with "FSR sharpening" (fsr_sharpness) and no Sharpening: its level
+    becomes Sharpening's, still only while FSR 1 enlarges the picture (sharpen_fsr_only), so nothing looks different
+    after updating. With RTX VSR or bilinear picked (which weren't sharpened), Sharpening starts at Off.
+    Returns (the values, whether anything was carried over). A file with Sharpening but not sharpen_fsr_only (written
+    by hand) uses it wherever the picture is drawn, as a choice the player made."""
+    old = values.get("fsr_sharpness")
+    if "sharpening" in values:
+        values.setdefault("sharpen_fsr_only", False)
+        return values, False
+    if isinstance(old, bool) or old not in {v: k for k, v in SHARPEN_STOPS.items()}:
+        return values, False
+    scaler = values.get("scaler")
+    fsr = scaler not in BY_KEY["scaler"].choices or scaler == "fsr"  # (an unknown one: FSR 1, the default)
+    level = next(k for k, v in SHARPEN_STOPS.items() if v == old)
+    values.update(sharpening=level if fsr else "off", sharpen_fsr_only=fsr)
+    return values, True
+
+
 class Settings:
     """Current values, saved to JSON on every change. Values given on the command line (`override`) apply to
     this run only and aren't saved unless changed in the menu."""
@@ -367,7 +402,8 @@ class Settings:
         self._listeners: list[Callable[[str], None]] = []
         self._v = {s.key: s.default for s in SPECS}
         self._saved = dict(self._v)  # what the file holds (or would)
-        for k, v in (values or {}).items():
+        values, self.carried = _carry_over(dict(values or {}))
+        for k, v in values.items():
             if k in BY_KEY and BY_KEY[k].saved and v in BY_KEY[k].choices:
                 self._v[k] = self._saved[k] = v
 
@@ -377,7 +413,10 @@ class Settings:
             values = json.loads(Path(path).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             values = {}
-        return cls(values if isinstance(values, dict) else {}, path)
+        st = cls(values if isinstance(values, dict) else {}, path)
+        if st.carried:  # written now, so the launcher (which reads the file itself) shows what was carried over
+            st.save()
+        return st
 
     def __getattr__(self, key: str) -> Any:
         try:
@@ -401,14 +440,17 @@ class Settings:
         self._put(key, value, save=True)
 
     def _put(self, key: str, value: Any, save: bool) -> None:
-        if value not in BY_KEY[key].choices:
-            raise ValueError(f"{key}: {value!r} is not one of {BY_KEY[key].choices}")
-        changed = self._v[key] != value
-        self._v[key] = value
-        if save and BY_KEY[key].saved:
-            self._saved[key] = value
+        spec = BY_KEY[key]
+        if value not in spec.choices:
+            raise ValueError(f"{key}: {value!r} is not one of {spec.choices}")
+        changed = any(self._v[k] != v for k, v in ((key, value), *spec.also.items()))
+        for k, v in ((key, value), *spec.also.items()):
+            self._v[k] = v
+            if save and BY_KEY[k].saved:
+                self._saved[k] = v
+        if save and spec.saved:
             self.save()
-        if changed:
+        if changed:  # told about the key that was set; its `also` keys are already set too
             for fn in list(self._listeners):
                 fn(key)
 
@@ -445,10 +487,14 @@ def specs_json(specs: tuple[Spec, ...] = SPECS) -> dict:
                    "sources": list(s.sources) or None,
                    "elsewhere": s.elsewhere or None,
                    "applies": {"key": s.applies[0], "values": list(s.applies[1])} if s.applies else None,
+                   "also": s.also or None,
                    "choices": [{"value": v, "name": s.name(v), "hint": s.hints.get(v, "")} for v in s.choices]}
-                  for s in specs],
+                  for s in specs if not s.hidden],
     }
 
 
 if __name__ == "__main__":
+    # The launcher's Settings page runs this for the list. Loading the file first carries an older one's settings
+    # over (and writes them), so the page shows them before anything has played.
+    Settings.load(Path(os.environ.get("SMOOVPLAY_SETTINGS") or DEFAULT_PATH))
     print(json.dumps(specs_json()))

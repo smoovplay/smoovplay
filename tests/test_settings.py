@@ -16,9 +16,9 @@ def test_defaults_are_valid_choices():
 
 def test_load_save_roundtrip_and_bad_values_ignored(tmp_path):
     path = tmp_path / "settings.json"
-    path.write_text(json.dumps({"hz": 90, "scaler": "nope", "unknown": 1, "fsr_sharpness": 0.25}))
+    path.write_text(json.dumps({"hz": 90, "scaler": "nope", "unknown": 1, "sharpening": "high"}))
     st = Settings.load(path)
-    assert st.hz == 90 and st.scaler == "fsr" and st.fsr_sharpness == 0.25
+    assert st.hz == 90 and st.scaler == "fsr" and st.sharpening == "high"
     st.set("scaler", "bilinear")
     assert json.loads(path.read_text())["scaler"] == "bilinear"
     assert Settings.load(path).scaler == "bilinear"
@@ -170,18 +170,18 @@ def test_every_setting_is_on_a_page():
         st = Settings(vals)
         m = Menu(st)
         on_pages = {s.key for p in [None] + m.sections() for kind, s in m.page_rows(p) if kind == "setting"}
-        assert on_pages == {s.key for s in SPECS if s.applies_to(st.values())}, vals
+        assert on_pages == {s.key for s in SPECS if s.applies_to(st.values()) and not s.hidden}, vals
 
 
 def test_menu_disabled_row_and_restart_row():
     st = Settings()
     pending: list[str] = []
-    m = Menu(st, disabled=lambda k: "n/a" if k == "fsr_sharpness" else None, restart_reasons=lambda: pending)
+    m = Menu(st, disabled=lambda k: "n/a" if k == "sharpening" else None, restart_reasons=lambda: pending)
     _open(m, "Picture")
-    m.index = _keys(m).index("fsr_sharpness")
+    m.index = _keys(m).index("sharpening")
     m.key("right")
-    assert st.fsr_sharpness == BY_KEY["fsr_sharpness"].default  # greyed out: no change
-    assert _keys(m) == ["scaler", "fsr_sharpness", "hdr", "capture_size"]  # RTX VSR quality: hidden
+    assert st.sharpening == BY_KEY["sharpening"].default  # greyed out: no change
+    assert _keys(m) == ["scaler", "sharpening", "hdr", "capture_size"]  # RTX VSR quality: hidden
     pending.append("AI engine")
     assert m.rows()[-1][0] == "restart"
     m.index = len(m.rows()) - 1
@@ -209,14 +209,15 @@ def test_specs_json_is_what_the_launcher_needs():
     data = json.loads(json.dumps(specs_json()))  # JSON-safe
     assert data["path"].endswith("settings.json")
     keys = [s["key"] for s in data["specs"]]
-    assert keys == [s.key for s in SPECS]
+    assert keys == [s.key for s in SPECS if not s.hidden] and "sharpen_fsr_only" not in keys
     for s in data["specs"]:
         assert s["group"] and s["label"] and s["help"], s["key"]
         assert s["default"] in [c["value"] for c in s["choices"]], s["key"]
     sim = next(s for s in data["specs"] if s["key"] == "simulate_30")
     assert sim["saved"] is False
-    sharp = next(s for s in data["specs"] if s["key"] == "fsr_sharpness")
-    assert [c["name"] for c in sharp["choices"]][:2] == ["Max", "High"]
+    sharp = next(s for s in data["specs"] if s["key"] == "sharpening")
+    assert [c["name"] for c in sharp["choices"]] == ["Off", "Minimal", "Low", "Medium", "High", "Max"]
+    assert sharp["also"] == {"sharpen_fsr_only": False}  # the launcher writes it too (SettingsPage.cs ChangeSetting)
     model = next(s for s in data["specs"] if s["key"] == "model")
     assert model["live"] is False and model["later"] and model["choices"][0]["name"].startswith("RIFE")
     scaler = next(s for s in data["specs"] if s["key"] == "scaler")
@@ -330,15 +331,17 @@ def _remote(tmp_path, commands, allowed=lambda k, v: True, disabled=lambda k: No
 
 
 def test_remote_set_applies_saves_and_reports(tmp_path):
-    st, r, states = _remote(tmp_path, ["set hz 90", "set fsr_sharpness 1", "set overlay false"])
+    st, r, states = _remote(tmp_path, ["set hz 90", "set vsr_quality 3.0", "set sharpening \"low\"",
+                                       "set overlay false"])
     assert r.poll() is None
-    assert (st.hz, st.fsr_sharpness, st.overlay) == (90, 1.0, False)
-    assert isinstance(st.fsr_sharpness, float)  # the spec's own type, so the menu still finds it
+    assert (st.hz, st.vsr_quality, st.sharpening, st.overlay) == (90, 3, "low", False)
+    assert isinstance(st.vsr_quality, int)  # the spec's own type, so the menu still finds it
     saved = json.loads((tmp_path / "settings.json").read_text())
     assert saved["hz"] == 90 and saved["overlay"] is False
+    assert saved["sharpening"] == "low" and saved["sharpen_fsr_only"] is False  # set from the launcher: everywhere
     last = states()[-1]
     assert last["values"]["hz"] == 90 and last["restart"] == []
-    assert len(states()) == 3  # one per change
+    assert len(states()) == 4  # one per change
 
 
 def test_remote_refuses_bad_and_unavailable_values(tmp_path, capsys):
@@ -375,13 +378,13 @@ def test_rows_that_dont_apply_are_hidden_and_the_highlight_stays_put():
     st = Settings()
     menu = Menu(st, SPECS)
     keys = lambda: [Menu._row_key(r) for p in [None] + menu.sections() for r in menu.page_rows(p)]  # noqa: E731
-    assert "vfg_quality" not in keys() and "fsr_sharpness" in keys() and "vsr_quality" not in keys()
+    assert "vfg_quality" not in keys() and "sharpening" in keys() and "vsr_quality" not in keys()
     _open(menu, "Picture")
     while menu.rows()[menu.index][1].key != "scaler":
         menu.key("down")
-    menu.key("right")  # FSR 1 -> RTX VSR: FSR sharpening goes, RTX VSR quality comes
+    menu.key("right")  # FSR 1 -> RTX VSR: RTX VSR quality comes, and Sharpening stays (it's for every upscaler)
     assert st.scaler == "vsr"
-    assert "fsr_sharpness" not in keys() and "vsr_quality" in keys()
+    assert "sharpening" in keys() and "vsr_quality" in keys()
     menu.key("enter")  # still on the upscaler row, though the rows above and below changed
     assert st.scaler == "bilinear"
     st.set("model", "vfg")

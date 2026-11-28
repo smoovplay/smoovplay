@@ -518,8 +518,9 @@ class GLWindowSink:
     does. vsync off presents immediately (lowest latency, may tear); on a G-Sync/FreeSync display vsync on lets
     VRR follow our frame timing instead of tearing. When the window is bigger than the frame it upscales: "fsr"
     with AMD FSR 1 (~0.1 ms GPU at 1440p), "vsr" with NVIDIA RTX Video Super Resolution (needs NVIDIA's package
-    or the RTX Video SDK, see framegen/rtxvsr.py, and frames on the GPU), "bilinear" with a plain filtered blit. A
-    look (framegen/looks.py, drawn by framegen/looks_gl.py) goes on after that, at the window's size.
+    or the RTX Video SDK, see framegen/rtxvsr.py, and frames on the GPU), "bilinear" with a plain filtered blit.
+    Sharpening (AMD's RCAS, framegen/fsr.py) goes on after any of them, or on the picture as it is, and a look
+    (framegen/looks.py, drawn by framegen/looks_gl.py) after that, at the window's size.
     Keys: m/Tab = settings menu (arrows + Enter in it, Esc back a page), i = interpolation on/off for this session, s = stats
     overlay (off, minimal, detailed), f = fullscreen, u = next upscaler, k = look on/off, j = next look (Shift+J:
     the one before), l = delay test (PS5 Remote Play), r = save the instant replay, b = save a before & after video
@@ -562,7 +563,7 @@ class GLWindowSink:
         from .settings import Settings
 
         self.settings = st = settings if settings is not None else Settings()
-        scaler, sharpness, vsr_quality = st.scaler, st.fsr_sharpness, st.vsr_quality
+        scaler, vsr_quality = st.scaler, st.vsr_quality
         self.glfw, self.GL, self.w, self.h = glfw, GL, w, h
         if not glfw.init():
             raise RuntimeError("glfw init failed")
@@ -637,7 +638,7 @@ class GLWindowSink:
         from .fsr import FsrScaler, GpuTimer
         self.fsr = self.vsr = self.vsr_out = None
         try:
-            self.fsr = FsrScaler(GL, sharpness, hdr=self.hdr10)
+            self.fsr = FsrScaler(GL, None, hdr=self.hdr10)  # (its sharpness is set for each frame: _sharpness)
         except Exception as e:  # noqa: BLE001 - shader trouble just means another scaler
             print(f"[display] FSR 1 unavailable ({str(e)[:200]})")
         self.vsr_why = ("it isn't used with HDR output yet" if self.hdr10 else
@@ -655,8 +656,9 @@ class GLWindowSink:
         self.mode = scaler if scaler in self.modes else self.modes[0]
         if self.mode == "vsr" and not self._vsr_ready():
             self.mode = self.modes[0]
-        details = {"fsr": f" (sharpness {sharpness:g})", "vsr": f" (quality {vsr_quality})", "bilinear": ""}
-        print(f"[display] upscaling with {self._name(self.mode)}{details[self.mode]}; u cycles "
+        details = {"fsr": "", "vsr": f" (quality {vsr_quality})", "bilinear": ""}
+        print(f"[display] upscaling with {self._name(self.mode)}{details[self.mode]}, sharpening "
+              f"{self._sharp_text()}; u cycles "
               + " / ".join(self._name(m) for m in self.modes) + "; m opens the settings menu")
         self.timer = GpuTimer(GL)  # GPU time of the scale/draw step, reported on close
 
@@ -674,6 +676,7 @@ class GLWindowSink:
                 print(f"[display] Looks unavailable ({str(e)[:200]})")
         self._frame_no = 0
         self._bake = None  # instant replay with "Looks in clips": (texture, framebuffer, CudaGLReader)
+        self._bake_sharp = None  # and the sharpened frame the look is drawn from: (texture, framebuffer)
         self._bake_said = False
 
         self.choices, self.unavailable = dict(choices or {}), dict(unavailable or {})
@@ -961,8 +964,8 @@ class GLWindowSink:
     def disabled(self, key: str) -> str | None:
         if key == "vsr_quality" and self.vsr is None and self._vsr_args is None:
             return f"RTX VSR isn't available: {self.vsr_why}."
-        if key == "fsr_sharpness" and self.fsr is None:
-            return "FSR 1 couldn't start on this GPU."
+        if key == "sharpening" and self.fsr is None:
+            return "Sharpening uses FSR 1's shaders, which couldn't start on this graphics card."
         return self.unavailable.get(key)
 
     def _apply(self, key: str) -> None:
@@ -973,8 +976,6 @@ class GLWindowSink:
                 self.mode = st.scaler
             else:
                 self.toast(f"RTX VSR couldn't start: {self.vsr_why}", 5.0)
-        elif key == "fsr_sharpness" and self.fsr is not None:
-            self.fsr.sharpness = st.fsr_sharpness
         elif key == "vsr_quality" and self.vsr is not None:
             self.vsr.quality = st.vsr_quality
         elif key == "overlay":
@@ -1354,15 +1355,28 @@ class GLWindowSink:
         mode = self.mode
         if mode == "vsr" and not on_gpu:  # a CPU frame: VSR needs it on the GPU
             mode = "fsr" if self.fsr is not None else "bilinear"
+        fsr = upscale and mode == "fsr"
+        sharp = self._sharpness(fsr)  # RCAS for this frame: FSR 1's own pass, or on its own after the others
         label = self._name(mode) if upscale else "no upscale"
+        if sharp is not None and not fsr:
+            label += " + sharpening"
+        elif fsr and sharp is None:
+            label += " (no sharpening)"
         self._frame_no += 1
         plan = self.look_gl.plan(self.looks.current(), self.looks.rev) if self.look_gl is not None else None
         q = self.timer.begin()
+        if fsr:
+            self.fsr.sharpness = sharp
         if plan is not None:  # the upscaler draws into the look's input, and the look onto the screen
-            if upscale and mode == "fsr":
+            if fsr:
                 src, fbo = self.look_gl.input_target(dw, dh)
                 self.fsr.draw(self.tex, self.w, self.h, fbo, 0, 0, dw, dh)
                 flip_in = True  # (FSR draws upright)
+            elif sharp is not None:  # RCAS draws into the look's input, upright like FSR
+                sized = self._vsr_render(dw, dh)[0] if upscale and mode == "vsr" else self._sized(dw, dh)
+                src, fbo = self.look_gl.input_target(dw, dh)
+                self.fsr.sharpen(sized, fbo, 0, 0, dw, dh, sharp)
+                flip_in = True
             elif upscale and mode == "vsr":
                 src, flip_in = self._vsr_render(dw, dh)[0], False
             else:
@@ -1370,8 +1384,12 @@ class GLWindowSink:
             self.look_gl.draw(plan, src, flip_in, target, x0, y0, dw, dh, True, self._frame_no)
             GL.glViewport(0, 0, fw, fh)
             label += " + look"
-        elif upscale and mode == "fsr":
+        elif fsr:
             self.fsr.draw(self.tex, self.w, self.h, target, x0, y0, dw, dh)
+            GL.glViewport(0, 0, fw, fh)
+        elif sharp is not None:
+            sized = self._vsr_render(dw, dh)[0] if upscale and mode == "vsr" else self._sized(dw, dh)
+            self.fsr.sharpen(sized, target, x0, y0, dw, dh, sharp)
             GL.glViewport(0, 0, fw, fh)
         elif upscale and mode == "vsr":
             self._vsr_draw(x0, y0, dw, dh)
@@ -1398,6 +1416,38 @@ class GLWindowSink:
             return "quit"
         cmd, self.cmd = self.cmd, None
         return cmd
+
+    def _sharpness(self, fsr: bool) -> float | None:
+        """RCAS's sharpness for a frame (Settings "Sharpening", in stops below its maximum), or None for none. fsr:
+        FSR 1 is enlarging this one. Carried over from FSR sharpening (0.3.14 and before), it applies only then, as
+        it did, until the player changes Sharpening (sharpen_fsr_only)."""
+        from .settings import SHARPEN_STOPS
+        st = self.settings
+        stops = SHARPEN_STOPS.get(st.sharpening)
+        if stops is None or self.fsr is None or (st.sharpen_fsr_only and not fsr):
+            return None
+        return stops
+
+    def _sharp_text(self) -> str:
+        """Sharpening for the log: "Medium", "Medium, only while FSR 1 enlarges (as before 0.3.15)", "Off"."""
+        from .settings import BY_KEY
+        st = self.settings
+        name = BY_KEY["sharpening"].name(st.sharpening)
+        if self.fsr is None:
+            return "unavailable (FSR 1's shaders couldn't start)"
+        if st.sharpen_fsr_only and st.sharpening != "off":
+            return name + ", only while FSR 1 enlarges (as before 0.3.15)"
+        return name
+
+    def _sized(self, dw: int, dh: int) -> int:
+        """The frame at dw x dh (row 0 = image top) for sharpening on its own: its texture as it is at the stream's
+        size, otherwise a bilinear copy into FSR's stage texture (as bilinear, or no upscale, draws it)."""
+        if (dw, dh) == (self.w, self.h):
+            return self.tex
+        tex, fbo = self.fsr.stage(dw, dh)
+        self.GL.glBindFramebuffer(self.GL.GL_DRAW_FRAMEBUFFER, fbo)
+        self.blitter.copy(self.tex, self.w, self.h, self.fbo, (0, 0, self.w, self.h), (0, 0, dw, dh), True)
+        return tex
 
     def _plain(self, x0: int, y0: int, dw: int, dh: int) -> None:
         """The frame's texture into the picture's rectangle with no upscaler: a bilinear copy (blit) to the bound
@@ -1506,35 +1556,57 @@ class GLWindowSink:
         return {"look-show": show, "look-hide": lambda _text: self.looks.show(None), "looks-reload": reload}
 
     def baked(self, frame):
-        """The frame just shown, with the look drawn on at the stream's size: for instant replay with "Looks in
-        clips" on (framegen/replay.py). Call right after write(), on its thread. The frame itself when no look is on,
-        or when the frames aren't on the graphics card (then it says so, once)."""
+        """The frame just shown, sharpened and with the look drawn on, at the stream's size: for instant replay with
+        "Looks in clips" on (framegen/replay.py). Call right after write(), on its thread. The frame itself when
+        neither is on, or when the frames aren't on the graphics card (then it says so, once). Sharpening carried
+        over from FSR sharpening isn't used here: it was only while FSR 1 enlarged the picture, and a clip isn't."""
         plan = self.look_gl.plan(self.looks.current(), self.looks.rev) if self.look_gl is not None else None
-        if plan is None:
+        sharp = self._sharpness(False)
+        if plan is None and sharp is None:
             return frame
         if not (_is_cuda(frame) and self.interop is not None):
             if not self._bake_said:
                 self._bake_said = True
-                print("[looks] Looks in clips needs the frames on the graphics card; clips are saved without it")
-                self.toast("Clips are saved without the look (it needs the frames on the graphics card)", 5.0)
+                what = "sharpening" if plan is None else "the look" if sharp is None else "the look or sharpening"
+                print(f"[looks] Looks in clips needs the frames on the graphics card; clips are saved without {what}")
+                self.toast(f"Clips are saved without {what} (it needs the frames on the graphics card)", 5.0)
             return frame
         import torch
         GL = self.GL
         if self._bake is None:
             from .glcuda import CudaGLReader
-            tex = GL.glGenTextures(1)
-            GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
-            GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8, self.w, self.h, 0, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, None)
-            fbo = GL.glGenFramebuffers(1)
-            GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, fbo)
-            GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, GL.GL_TEXTURE_2D, tex, 0)
+            tex, fbo = self._bake_target()
             self._bake = (tex, fbo, CudaGLReader(int(tex), self.w, self.h))
         tex, fbo, reader = self._bake
-        self.look_gl.draw(plan, self.tex, False, fbo, 0, 0, self.w, self.h, False, self._frame_no, "bake")
+        src = self.tex
+        if sharp is not None and plan is None:
+            self.fsr.sharpen(self.tex, fbo, 0, 0, self.w, self.h, sharp, flip=False)
+        elif sharp is not None:  # sharpened first, as on the screen, then the look
+            if self._bake_sharp is None:
+                self._bake_sharp = self._bake_target()
+            src = self._bake_sharp[0]
+            self.fsr.sharpen(self.tex, self._bake_sharp[1], 0, 0, self.w, self.h, sharp, flip=False)
+        if plan is not None:
+            self.look_gl.draw(plan, src, False, fbo, 0, 0, self.w, self.h, False, self._frame_no, "bake")
         GL.glViewport(0, 0, *self.glfw.get_framebuffer_size(self.win))
         rgba = torch.empty((self.h, self.w, 4), dtype=torch.uint8, device=frame.device)
         reader.read(rgba)
         return rgba[..., [2, 1, 0]]  # BGR, like the frame
+
+    def _bake_target(self) -> tuple[int, int]:
+        """An RGBA8 texture at the stream's size and its framebuffer, for baked(). Filtered without mipmaps, so the
+        look can read it (the sharpened frame it's drawn from)."""
+        GL = self.GL
+        tex = GL.glGenTextures(1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+        for p, v in ((GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR), (GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR),
+                     (GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE), (GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)):
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, p, v)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8, self.w, self.h, 0, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, None)
+        fbo = GL.glGenFramebuffers(1)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, fbo)
+        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, GL.GL_TEXTURE_2D, tex, 0)
+        return tex, fbo
 
     def hide(self) -> None:
         """Take the window off the screen now, before what's left of stopping (clips finishing saving): close()
@@ -1576,6 +1648,9 @@ class GLWindowSink:
             self._bake[2].close()
             self.GL.glDeleteFramebuffers(1, [self._bake[1]])
             self.GL.glDeleteTextures([self._bake[0]])
+        if self._bake_sharp is not None:
+            self.GL.glDeleteFramebuffers(1, [self._bake_sharp[1]])
+            self.GL.glDeleteTextures([self._bake_sharp[0]])
         if self.look_gl is not None:
             self.look_gl.close()
         self.looks.close()
