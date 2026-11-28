@@ -1,0 +1,28 @@
+# The CPU tests on Windows, on every pull request and every push to main, so a change made on a Mac or Linux machine
+# is checked on the platform most players use before it's merged. GitHub's Windows machines have no graphics card:
+# the CUDA, OpenGL 4.5 and TensorRT tests skip themselves there, and the GPU checks stay on our own PC.
+name: Tests (Windows)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"  # the version the installer ships (installer/build.py PYTHON_VERSION)
+          cache: pip
+      - name: Install
+        run: python -m pip install -r requirements.txt
+      - name: Run the tests
+        run: python -m pytest tests -q
