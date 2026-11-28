@@ -255,6 +255,18 @@ def frame_log(results: str | None) -> str | None:
     return str(path)
 
 
+def close_interp(interp) -> None:
+    """Frees what an interpolator holds outside PyTorch (NVIDIA VFG's effect, framegen/vfg.py), when a session ends
+    or restarts. The others have nothing to close."""
+    close = getattr(interp, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception as e:  # noqa: BLE001 - on the way out anyway
+        print(f"[run] closing {type(interp).__name__}: {str(e)[:200]}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("video", nargs="?", help="input video file")
@@ -819,6 +831,7 @@ def main() -> int:
             if hasattr(src, "hold"):
                 src.hold(True)  # no decoding on the GPU while the pipeline is rebuilt
             del pipe
+            close_interp(interp)
             interp = None
             gc.collect()
             torch.cuda.empty_cache()
@@ -853,6 +866,7 @@ def main() -> int:
             replay.close(wait_saves=30)  # a clip being saved is finished first; before & after carries on alone
         sink.close()
         src.close()
+        close_interp(interp)
         stop_results.set()
         if results_thread.is_alive():
             results_thread.join(timeout=5)  # so the last write below isn't racing one already under way

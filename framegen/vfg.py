@@ -155,9 +155,11 @@ class VfgInterpolator:
         return self.slots[slot].unsqueeze(0)  # (already RGB, 0..1)
 
     def close(self) -> None:
+        """Frees NVIDIA's effect. run.py calls it when a session ends or restarts."""
         close = getattr(self.fx, "close", None)
         if close is not None:
             close()
+        self.fx = None  # (as framegen/rtxvsr.py's VfxVsr.close does: no "nanobind: leaked" lines at exit)
 
 
 def _rgb(bgr: torch.Tensor, hdr: bool) -> torch.Tensor:

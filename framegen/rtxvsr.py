@@ -347,4 +347,9 @@ class VfxVsr:
 
     def close(self) -> None:
         torch.cuda.synchronize()
-        self.fx.close()
+        if self.fx is not None:
+            self.fx.close()
+            # Let go of NVIDIA's effect too: something can hold on to this object until Python exits (with the
+            # launcher, its settings link's thread, through the video window), and the effect's binding then lists
+            # it as leaked on the way out ("nanobind: leaked 1 instances!"), in every Copy diagnostics.
+            self.fx = None
